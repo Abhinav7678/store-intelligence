@@ -1,0 +1,25 @@
+{
+  "store_id": "STORE_BLR_002",
+  "store_name": "Brigade_Bangalore",
+  "city": "Bangalore",
+  "open_hours": {"open": "10:00", "close": "22:00"},
+  "cameras": [
+    {"camera_id": "CAM_1", "type": "entry", "position": "Entry threshold"},
+    {"camera_id": "CAM_2", "type": "floor", "position": "Main floor coverage"},
+    {"camera_id": "CAM_3", "type": "billing", "position": "Billing counter area"},
+    {"camera_id": "CAM_4", "type": "floor", "position": "Secondary floor"},
+    {"camera_id": "CAM_5", "type": "entry", "position": "Secondary entry"}
+  ],
+  "zones": {
+    "ENTRY": {"x1": 0, "y1": 0, "x2": 400, "y2": 300},
+    "SKINCARE": {"x1": 400, "y1": 0, "x2": 800, "y2": 400},
+    "MAKEUP": {"x1": 800, "y1": 0, "x2": 1200, "y2": 400},
+    "HAIRCARE": {"x1": 0, "y1": 400, "x2": 400, "y2": 700},
+    "FRAGRANCE": {"x1": 400, "y1": 400, "x2": 600, "y2": 700},
+    "BATH_BODY": {"x1": 600, "y1": 400, "x2": 900, "y2": 700},
+    "BILLING": {"x1": 1000, "y1": 400, "x2": 1300, "y2": 700},
+    "FOH": {"x1": 400, "y1": 300, "x2": 800, "y2": 500}
+  }
+}
+
+

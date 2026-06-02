@@ -1,0 +1,8 @@
+﻿fastapi
+uvicorn[standard]
+requests
+pydantic
+pytest
+pytest-cov
+httpx
+websockets
