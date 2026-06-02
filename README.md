@@ -3,7 +3,7 @@
 ## 🚀 Quick Start
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Abhinav7678/store-intelligence.git
 cd store-intelligence
 docker compose up --build
 ```
