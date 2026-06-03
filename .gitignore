@@ -29,3 +29,9 @@ yolov8n.pt
 .coverage
 __pycache__/
 data/*.db
+
+data/processed/
+data/CCTV Footage/
+data/*.db
+data/*.jsonl
+data/*.csv
