@@ -94,7 +94,15 @@ class TestMetricsEndpoint:
         resp = client.get("/stores/STORE_BLR_002/metrics")
         data = resp.json()
         assert data.get("unique_visitors", 0) >= 0
-
+    def test_metrics_no_pos_db(self):
+        """Test metrics when POS database doesn't exist."""
+        uid = _uid()
+        events = [make_event(f"mpos-{uid}", "ENTRY", "VMPOS1")]
+        client.post("/events/ingest", json={"events": events})
+        resp = client.get("/stores/STORE_BLR_002/metrics")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["conversion_rate"] == 0.0
 
 class TestFunnelEndpoint:
     def test_funnel_returns_stages(self):
