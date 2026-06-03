@@ -139,11 +139,12 @@ def store_metrics(store_id: str):
                 AND order_date = ?
             """, (store_id, today_prefix)).fetchall()
 
+            # Replace lines 140-156 with this:
+
             for pos in pos_rows:
                 ot = pos['order_time']
                 txn_time = pos['order_date'] + 'T' + ot if ot else pos['order_date']
 
-                # Find visitors in billing zone within 5 min before this transaction
                 billing_visitors = cur.execute("""
                     SELECT DISTINCT json_extract(payload, '$.visitor_id') as vid
                     FROM events
@@ -158,7 +159,7 @@ def store_metrics(store_id: str):
                     if bv['vid']:
                         converted_visitors.add(bv['vid'])
 
-                        pos_conn.close()
+            pos_conn.close()  # ← moved OUTSIDE the loop
         except Exception:
             pass
 

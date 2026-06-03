@@ -45,6 +45,10 @@
 </head>
 <body>
     <h1>🏪 Store Intelligence Dashboard</h1>
+    <select id="storeSelect" onchange="window.location.search='?store='+this.value" style="font-size:1.2em; padding:8px; margin:10px; border-radius:8px; background:#1e293b; color:#38bdf8; border:1px solid #38bdf8;">
+        <option value="ST1076">Store ST1076 (Mumbai)</option>
+        <option value="ST1008">Store ST1008</option>
+    </select>
 
     <!-- WebSocket status bar -->
     <div id="ws-bar">
@@ -95,7 +99,8 @@
     </div>
 
     <script>
-        const STORE_ID = "STORE_BLR_002";
+        const STORE_ID = new URLSearchParams(window.location.search).get('store') || "ST1076";
+        document.getElementById('storeSelect').value = STORE_ID;
         const API_BASE = "http://localhost:8000";
 
         // ── Metrics ───────────────────────────────────────────────────────────

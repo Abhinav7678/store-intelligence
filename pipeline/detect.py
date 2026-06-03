@@ -416,6 +416,10 @@ def process_clip(video_path, camera_id, store_id, layout_path, clip_start_time=N
 
     cap.release()
 
+    # Replace lines 431-432 in process_clip() with this (after cap.release(), before return):
+
+    cap.release()
+
     final_ts = (clip_start_time + timedelta(seconds=frame_idx / fps)).isoformat()
     for track_id, track in list(tracker.active_tracks.items()):
         is_staff = tracker._is_likely_staff(track)
@@ -428,9 +432,21 @@ def process_clip(video_path, camera_id, store_id, layout_path, clip_start_time=N
             session_seq=track.get("session_seq", 1)
         ))
 
+    # ── Per-clip summary ──
     print(f"\n   ✅ Done: {len(all_events)} events from {frame_idx} frames")
-    return all_events
+    event_types = {}
+    for e in all_events:
+        t = e["event_type"]
+        event_types[t] = event_types.get(t, 0) + 1
+    for t, count in sorted(event_types.items()):
+        print(f"      {t}: {count}")
+    visitors = set(e["visitor_id"] for e in all_events)
+    staff = set(e["visitor_id"] for e in all_events if e.get("is_staff"))
+    print(f"      Unique visitors: {len(visitors)}")
+    print(f"      Staff detected: {len(staff)}")
+    print(f"      Customers: {len(visitors) - len(staff)}")
 
+    return all_events
 
 def process_all_stores(layout_path="data/store_layout.json", start_time=None):
     """Process all clips from all stores defined in store_layout.json."""
