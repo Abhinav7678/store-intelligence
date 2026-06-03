@@ -1,15 +1,12 @@
 """
 # PROMPT: Generate tests for anomaly detection using actual queue_completed/queue_abandoned
 # events with queue_position_at_join field for queue spike detection.
-# CHANGES MADE: Updated to actual format. Queue spike uses queue_position_at_join > 5.
-# Conversion drop uses 20 entry events with zero queue_completed.
+# CHANGES MADE: Updated to actual format. Removed _clean_db to avoid wiping events.db.
 """
 import pytest
 from fastapi.testclient import TestClient
 from datetime import datetime, timezone
 import uuid
-import os
-import gc
 
 from app.main import app
 
@@ -57,21 +54,7 @@ def make_queue(eid, track_id, qd=8, abandoned=False):
     }
 
 
-def _clean_db():
-    gc.collect()
-    db_path = os.path.join(os.getcwd(), "data", "events.db")
-    try:
-        if os.path.exists(db_path):
-            os.remove(db_path)
-    except PermissionError:
-        pass
-    os.makedirs("data", exist_ok=True)
-
-
 class TestQueueSpike:
-    def setup_method(self):
-        _clean_db()
-
     def test_queue_spike_detected(self):
         events = [make_queue(f"qs_{i}_{_uid()}", i, qd=8) for i in range(6)]
         client.post("/events/ingest", json={"events": events})
@@ -90,23 +73,31 @@ class TestQueueSpike:
 
 
 class TestConversionDrop:
-    def setup_method(self):
-        _clean_db()
-
     def test_low_conversion_detected(self):
         uid = _uid()
-        events = [make_entry(f"cd_{i}_{uid}", f"VIS_{i}") for i in range(20)]
+        store = f"STORE_CONV_{uid}"
+        events = [
+            {
+                "event_id": f"cd_{i}_{uid}",
+                "event_type": "entry",
+                "id_token": f"VIS_{i}",
+                "store_code": store,
+                "camera_id": "cam1",
+                "event_timestamp": datetime.now(timezone.utc).isoformat(),
+                "is_staff": False,
+                "gender_pred": "M", "age_pred": 30, "age_bucket": "25-34",
+                "is_face_hidden": False, "group_id": None, "group_size": None,
+            }
+            for i in range(20)
+        ]
         client.post("/events/ingest", json={"events": events})
-        resp = client.get("/stores/STORE_BLR_002/anomalies")
+        resp = client.get(f"/stores/{store}/anomalies")
         data = resp.json()
         types = [a["type"] for a in data.get("anomalies", [])]
         assert "CONVERSION_DROP" in types
 
 
 class TestAnomalyFormat:
-    def setup_method(self):
-        _clean_db()
-
     def test_suggested_action_present(self):
         events = [make_entry(f"a1_{_uid()}", "V1")]
         client.post("/events/ingest", json={"events": events})

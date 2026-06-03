@@ -1,8 +1,8 @@
 """
 # PROMPT: Rewrite metrics endpoint for actual challenge data: entry/exit with id_token,
 # zone_entered/zone_exited with track_id, queue_completed/queue_abandoned, POS with DD-MM-YYYY dates
-# CHANGES MADE: Compute dwell from zone_entered/zone_exited time pairs, queue depth from
-# queue_position_at_join, abandonment from queue_abandoned events, POS correlation with actual CSV format.
+# CHANGES MADE: Queue depth from queue_joined - queue_completed/abandoned. Reentry counted as entry.
+# Staff excluded. POS correlation with actual CSV format.
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -36,7 +36,6 @@ def store_metrics(store_id: str):
         now = datetime.now(timezone.utc)
         today_prefix = now.strftime("%Y-%m-%d")
 
-        # Get all events for this store today
         cur.execute("""
             SELECT event_type, visitor_id, zone_id, zone_name, is_staff, timestamp, payload
             FROM events
@@ -44,7 +43,6 @@ def store_metrics(store_id: str):
         """, (store_id, f"{today_prefix}%"))
         rows = cur.fetchall()
 
-        # Also try matching without date filter if no results (events may have different date)
         if not rows:
             cur.execute("""
                 SELECT event_type, visitor_id, zone_id, zone_name, is_staff, timestamp, payload
@@ -64,11 +62,11 @@ def store_metrics(store_id: str):
             })
 
         visitors = set()
-        zone_enter_times = {}  # (visitor_id, zone_id) -> timestamp
+        zone_enter_times = {}
         zone_dwell_total = {}
         zone_dwell_count = {}
-        total_queue_depth = 0
-        queue_entries = 0
+        queue_joined = set()
+        queue_exited = set()
         abandonments = 0
         billing_visitors = set()
 
@@ -80,12 +78,12 @@ def store_metrics(store_id: str):
             if is_staff:
                 continue
 
-            # Count unique visitors from entry events
-            if event_type in ("entry", "ENTRY"):
+            # Count unique visitors from entry AND reentry events
+            if event_type in ("entry", "ENTRY", "reentry", "REENTRY"):
                 if visitor_id:
                     visitors.add(visitor_id)
 
-            # Zone dwell: compute from zone_entered → zone_exited pairs
+            # Zone dwell
             if event_type in ("zone_entered", "ZONE_ENTER"):
                 zone = row["zone_name"] or row["zone_id"] or ""
                 ts = row["timestamp"]
@@ -108,22 +106,18 @@ def store_metrics(store_id: str):
                         pass
                     del zone_enter_times[key]
 
-            # Queue events
-            if event_type in ("queue_completed", "queue_abandoned"):
-                queue_entries += 1
-                try:
-                    payload = json.loads(row["payload"]) if row["payload"] else {}
-                    qd = payload.get("queue_position_at_join")
-                    if qd is not None:
-                        total_queue_depth += int(qd)
-                except Exception:
-                    pass
+            # Queue events — track who joined and who left
+            if event_type in ("queue_joined", "queue_completed", "queue_abandoned", "BILLING_QUEUE_JOIN"):
+                if visitor_id:
+                    queue_joined.add(visitor_id)
 
-                if event_type == "queue_abandoned":
+            if event_type in ("queue_completed", "queue_abandoned", "BILLING_QUEUE_ABANDON"):
+                if visitor_id:
+                    queue_exited.add(visitor_id)
+                if event_type in ("queue_abandoned", "BILLING_QUEUE_ABANDON"):
                     abandonments += 1
-                else:
-                    if visitor_id:
-                        billing_visitors.add(visitor_id)
+                elif event_type == "queue_completed":
+                    billing_visitors.add(visitor_id)
 
         # If no entry events found, count all unique visitor_ids
         if not visitors:
@@ -146,17 +140,15 @@ def store_metrics(store_id: str):
                     try:
                         od = pos['order_date']
                         ot = pos['order_time']
-                        # Handle DD-MM-YYYY format
                         if '-' in od and len(od.split('-')[0]) == 2:
                             parts = od.split('-')
                             od = f"{parts[2]}-{parts[1]}-{parts[0]}"
                         txn_time = f"{od}T{ot}" if ot else od
 
-                        # Check for visitors in billing zone within 5 min before transaction
                         bv_rows = cur.execute("""
                             SELECT DISTINCT visitor_id FROM events
                             WHERE store_id = ?
-                            AND event_type IN ('queue_completed', 'BILLING_QUEUE_JOIN')
+                            AND event_type IN ('queue_completed', 'queue_joined', 'BILLING_QUEUE_JOIN')
                             AND is_staff = 0
                             AND timestamp BETWEEN datetime(?, '-5 minutes') AND datetime(?)
                         """, (store_id, txn_time, txn_time)).fetchall()
@@ -169,7 +161,6 @@ def store_metrics(store_id: str):
         except Exception:
             pass
 
-        # Also count queue_completed visitors as converted
         converted_visitors.update(billing_visitors)
 
         unique_visitors = len(visitors)
@@ -181,8 +172,10 @@ def store_metrics(store_id: str):
             for zone in zone_dwell_total if zone_dwell_count.get(zone, 0) > 0
         }
 
-        queue_depth = int(total_queue_depth / queue_entries) if queue_entries else 0
-        abandonment_rate = round((abandonments / queue_entries) * 100, 2) if queue_entries else 0.0
+        # Queue depth = people currently in queue (joined but not yet exited)
+        queue_depth = max(0, len(queue_joined) - len(queue_exited))
+        total_queue = len(queue_joined)
+        abandonment_rate = round((abandonments / total_queue) * 100, 2) if total_queue else 0.0
 
         conn.close()
         return JSONResponse(content={

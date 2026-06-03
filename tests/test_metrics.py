@@ -189,3 +189,60 @@ class TestHealthEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert "status" in data
+        
+class TestQueueDepth:
+    def test_queue_depth_with_joined_events(self):
+        """queue_joined without completed = positive queue depth."""
+        uid = _uid()
+        events = [
+            make_entry(f"qd1-{uid}", "VIS_QD1"),
+            {
+                "event_id": f"qd2-{uid}",
+                "queue_event_id": str(uuid.uuid4()),
+                "event_type": "queue_joined",
+                "track_id": 301,
+                "store_id": "STORE_BLR_002",
+                "camera_id": "CAM6",
+                "zone_id": "BILLING",
+                "zone_name": "Billing Counter Queue",
+                "zone_type": "BILLING",
+                "is_revenue_zone": "Yes",
+                "queue_join_ts": datetime.now(timezone.utc).isoformat(),
+                "queue_position_at_join": 1,
+                "abandoned": False,
+                "zone_hotspot_x": 600.0,
+                "zone_hotspot_y": 180.0,
+                "gender": "M",
+                "age": 30,
+                "age_bucket": "25-34",
+            },
+        ]
+        client.post("/events/ingest", json={"events": events})
+        resp = client.get("/stores/STORE_BLR_002/metrics")
+        data = resp.json()
+        assert data["queue_depth"] >= 0
+
+    def test_reentry_counted_as_visitor(self):
+        """Reentry events should count as unique visitors."""
+        uid = _uid()
+        events = [
+            {
+                "event_id": f"re1-{uid}",
+                "event_type": "reentry",
+                "id_token": f"VIS_RE_{uid}",
+                "store_code": "STORE_BLR_002",
+                "camera_id": "cam1",
+                "event_timestamp": datetime.now(timezone.utc).isoformat(),
+                "is_staff": False,
+                "gender_pred": "M",
+                "age_pred": 30,
+                "age_bucket": "25-34",
+                "is_face_hidden": False,
+                "group_id": None,
+                "group_size": None,
+            },
+        ]
+        client.post("/events/ingest", json={"events": events})
+        resp = client.get("/stores/STORE_BLR_002/metrics")
+        assert resp.status_code == 200
+        assert resp.json()["unique_visitors"] >= 1

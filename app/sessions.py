@@ -81,7 +81,7 @@ def reconstruct_sessions(payload_rows: List[str], store_id: str = None) -> List[
 
         et = payload.get("event_type", "")
 
-        if et in ("entry", "ENTRY"):
+        if et in ("entry", "ENTRY", "reentry", "REENTRY"):
             visitor_data[vid]["entered"] = True
         elif et in ("zone_entered", "ZONE_ENTER"):
             visitor_data[vid]["zone_visit"] = True

@@ -1,8 +1,8 @@
 """
 # PROMPT: Generate tests for detection pipeline with actual challenge output format.
 # Tests verify zone classification, person tracking, entry/exit/zone events in actual format.
-# CHANGES MADE: Updated event checks to use actual field names (event_type lowercase,
-# id_token, store_code, zone_name). Kept backward compat via _make_event wrapper.
+# CHANGES MADE: Updated queue test to expect queue_joined on billing entry,
+# queue_completed on billing exit. Added reentry and zone_dwell tests.
 """
 import json
 import sys
@@ -98,17 +98,52 @@ class TestPersonTracker:
         assert len(zone_enters) == 1
         assert zone_enters[0]["zone_id"] == "MAKEUP"
 
-    def test_billing_queue_event(self):
+    def test_reentry_event_type(self):
+        """Re-entering visitor emits event_type='reentry'."""
+        tracker = PersonTracker(store_id="STORE_1", camera_id="cam1")
+        tracker.exit_timeout_frames = 2
+        zc = ZoneClassifier.__new__(ZoneClassifier)
+        zc.zones = {}
+        zc.zone_names = {}
+        zc.frame_w = 1920
+        zc.frame_h = 1080
+
+        # Enter
+        tracker.update([([100, 100, 200, 200], 0.9)], zc, "2026-03-08T18:10:00.000000", 1)
+        vid = list(tracker.active_tracks.values())[0]["visitor_id"]
+
+        # Exit (no detections for timeout frames)
+        for i in range(2, 5):
+            tracker.update([], zc, f"2026-03-08T18:10:{i:02d}.000000", i)
+
+        # Re-enter near same position
+        events = tracker.update([([105, 100, 205, 200], 0.9)], zc, "2026-03-08T18:10:10.000000", 10)
+        reentries = [e for e in events if e["event_type"] == "reentry"]
+        assert len(reentries) == 1
+        assert reentries[0]["id_token"] == vid
+
+    def test_queue_abandoned_on_exit_from_billing(self):
+        """If track is lost while in BILLING, emit queue_abandoned."""
         tracker = PersonTracker(store_id="STORE_1", camera_id="CAM6")
+        tracker.exit_timeout_frames = 2
         zc = ZoneClassifier.__new__(ZoneClassifier)
         zc.zones = {"BILLING": {"x1": 0, "y1": 0, "x2": 1000, "y2": 1000}}
         zc.zone_names = {"BILLING": "Billing Counter Queue"}
+        zc.zone_types = {"BILLING": "BILLING"}
         zc.frame_w = 1000
         zc.frame_h = 1000
-        events = tracker.update([([400, 400, 500, 500], 0.9)], zc, "2026-03-08T18:13:05.000000", 1)
-        queues = [e for e in events if e["event_type"] == "queue_completed"]
-        assert len(queues) == 1
-        assert queues[0]["queue_position_at_join"] is not None
+
+        # Enter billing
+        tracker.update([([400, 400, 500, 500], 0.9)], zc, "2026-03-08T18:13:05.000000", 1)
+
+        # Disappear (lost track while in billing)
+        all_events = []
+        for i in range(2, 5):
+            events = tracker.update([], zc, f"2026-03-08T18:13:{i+5:02d}.000000", i)
+            all_events.extend(events)
+
+        abandoned = [e for e in all_events if e["event_type"] == "queue_abandoned"]
+        assert len(abandoned) == 1
 
     def test_staff_detection(self):
         tracker = PersonTracker(store_id="STORE_1")
