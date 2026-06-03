@@ -3,6 +3,7 @@
 # and session reconstruction with entry/exit/zone_entered events.
 # CHANGES MADE: Updated to use model_validate instead of parse_obj. Test events
 # use actual format fields (id_token, store_code, event_timestamp).
+# Fixed POS tests to create table if missing (CI environment).
 """
 from app.schemas import Event
 from app.sessions import reconstruct_sessions
@@ -58,17 +59,14 @@ def test_schema_validation_zone():
 def test_reconstruct_sessions_reentry_and_exit():
     now = datetime.utcnow()
     rows = []
-    # First session
     rows.append(json.dumps({"id_token": "V1", "event_type": "entry", "event_timestamp": (now - timedelta(minutes=40)).isoformat()}))
     rows.append(json.dumps({"track_id": 101, "event_type": "zone_entered", "zone_name": "Left Shelf", "event_time": (now - timedelta(minutes=39)).isoformat()}))
     rows.append(json.dumps({"id_token": "V1", "event_type": "exit", "event_timestamp": (now - timedelta(minutes=38)).isoformat()}))
-    # Re-entry
     rows.append(json.dumps({"id_token": "V1", "event_type": "entry", "event_timestamp": (now - timedelta(minutes=30)).isoformat()}))
     rows.append(json.dumps({"track_id": 102, "event_type": "zone_entered", "zone_name": "Center Display", "event_time": (now - timedelta(minutes=29)).isoformat()}))
-
     sessions = reconstruct_sessions(rows)
     assert len(sessions) >= 2
-    
+
 
 def test_staff_excluded_from_sessions():
     rows = [json.dumps({"event_type": "entry", "id_token": "STAFF_1", "is_staff": True})]
@@ -146,6 +144,55 @@ def test_parse_ts_variants():
     assert _parse_ts("2026-06-03T10:00:00+05:30").year == 2026
     assert _parse_ts("not-a-date") is not None
 
+
+def _ensure_pos_table(conn):
+    """Create pos_transactions table if it doesn't exist (CI environment)."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(pos_transactions)").fetchall()]
+    if not cols:
+        conn.execute("""CREATE TABLE pos_transactions (
+            order_id TEXT, store_id TEXT, order_date TEXT, order_time TEXT,
+            basket_value REAL
+        )""")
+        conn.commit()
+        cols = ["order_id", "store_id", "order_date", "order_time", "basket_value"]
+    return cols
+
+
+def test_pos_correlation_marks_purchased():
+    """Test POS correlation: visitor in queue within 5 min of POS transaction."""
+    import os, sqlite3
+    pos_db = os.path.join("data", "store_intelligence.db")
+    os.makedirs("data", exist_ok=True)
+
+    conn = sqlite3.connect(pos_db)
+    cols = _ensure_pos_table(conn)
+    conn.execute("DELETE FROM pos_transactions WHERE store_id='TEST_POS'")
+    col_str = ", ".join(cols)
+    placeholders = ", ".join(["?"] * len(cols))
+    values = []
+    for c in cols:
+        if c == "store_id": values.append("TEST_POS")
+        elif c == "order_id": values.append("TXN1")
+        elif c == "order_date": values.append("03-06-2026")
+        elif c == "order_time": values.append("10:05:00")
+        elif c == "basket_value": values.append(500.0)
+        else: values.append(None)
+    conn.execute(f"INSERT INTO pos_transactions ({col_str}) VALUES ({placeholders})", values)
+    conn.commit()
+    conn.close()
+
+    rows = [
+        json.dumps({"event_type": "entry", "id_token": "VIS_POS1", "is_staff": False}),
+        json.dumps({
+            "event_type": "queue_abandoned", "track_id": "VIS_POS1", "is_staff": False,
+            "queue_join_ts": "2026-06-03T10:02:00",
+        }),
+    ]
+    sessions = reconstruct_sessions(rows, store_id="TEST_POS")
+    vis = [s for s in sessions if s["visitor_id"] == "VIS_POS1"]
+    assert any(s["purchased"] for s in vis)
+
+
 def test_pos_no_match_outside_window():
     """POS transaction too far from queue time — no purchase."""
     import os, sqlite3
@@ -153,7 +200,7 @@ def test_pos_no_match_outside_window():
     os.makedirs("data", exist_ok=True)
 
     conn = sqlite3.connect(pos_db)
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(pos_transactions)").fetchall()]
+    cols = _ensure_pos_table(conn)
     conn.execute("DELETE FROM pos_transactions WHERE store_id='TEST_POS2'")
     col_str = ", ".join(cols)
     placeholders = ", ".join(["?"] * len(cols))
@@ -178,6 +225,7 @@ def test_pos_no_match_outside_window():
     sessions = reconstruct_sessions(rows, store_id="TEST_POS2")
     assert not any(s["purchased"] for s in sessions)
 
+
 def test_load_pos_no_db():
     """When POS DB doesn't exist, sessions still work."""
     from app.sessions import _load_pos_transactions
@@ -190,7 +238,7 @@ def test_sessions_with_store_id_no_pos():
     sessions = reconstruct_sessions(rows, store_id="NO_SUCH_STORE_999")
     assert len(sessions) == 1
     assert sessions[0]["purchased"] is False
-   
+
 
 def test_schema_validation_reentry():
     ev = {
