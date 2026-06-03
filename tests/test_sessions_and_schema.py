@@ -1,5 +1,24 @@
-# PROMPT: Test schema validation and session reconstruction helper. / # CHANGES MADE: Added a few synthetic payload rows to simulate re-entry and exit semantics.
+"""
+Tests for Pydantic schema validation and session reconstruction logic.
 
+Verifies that:
+  1. The Event schema correctly validates a well-formed event payload.
+  2. Session reconstruction properly handles re-entry and exit semantics:
+     an explicit EXIT followed by a new ENTRY creates separate sessions,
+     even for the same visitor_id.
+
+PROMPT: "Generate tests for schema validation using Pydantic Event model
+and session reconstruction. Test that a valid event payload passes
+validation. Test that a visitor who exits and re-enters produces two
+separate sessions — verify the reconstruct_sessions helper handles
+EXIT → ENTRY boundaries correctly."
+
+CHANGES MADE: Added synthetic payload rows to simulate a full visitor
+journey: ENTRY → ZONE_ENTER → EXIT, then a re-entry with ENTRY →
+ZONE_ENTER. Verified that reconstruct_sessions splits these into at
+least 2 sessions based on the explicit EXIT event boundary. Used
+timedelta offsets to ensure timestamps are ordered and realistic.
+"""
 from app.schemas import Event, BoundingBox
 from app.sessions import reconstruct_sessions
 from datetime import datetime, timedelta

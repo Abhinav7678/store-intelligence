@@ -1,3 +1,22 @@
+"""
+Tests for event ingestion idempotency and input validation.
+
+Verifies that:
+  1. Posting the same event batch twice is safe — duplicates are ignored.
+  2. Malformed events cause the entire batch to be rejected (422) by
+     Pydantic validation before any database writes occur.
+
+PROMPT: "Generate pytest tests for idempotent event ingestion — verify
+that posting the same batch twice results in 0 accepted and 2 duplicates
+ignored on the second call. Also test that a batch containing an invalid
+event (missing required fields) is fully rejected with HTTP 422."
+
+CHANGES MADE: Added unique UUID suffix per test run to avoid cross-test
+interference from prior ingested events. Changed assertion field from
+'duplicate' to 'duplicates_ignored' to match actual API response schema.
+Added test_partial_rejection to confirm Pydantic validates the entire
+batch atomically — no partial ingest occurs.
+"""
 import os
 import uuid
 from fastapi.testclient import TestClient

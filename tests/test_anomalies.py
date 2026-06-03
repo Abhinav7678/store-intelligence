@@ -1,7 +1,22 @@
 """
-# PROMPT: Test anomalies detection rules.
-# CHANGES MADE: Allow either WARN or CRITICAL severity for queue spike depending on queue depth.
-# Fixed setup to use setup_method for class-based tests.
+Tests for anomaly detection rules in the Store Intelligence API.
+
+Verifies that the /stores/{id}/anomalies endpoint correctly detects:
+  - BILLING_QUEUE_SPIKE when queue depth exceeds threshold
+  - CONVERSION_DROP when many visitors enter but none purchase
+  - Proper anomaly format with severity and suggested_action fields
+
+PROMPT: "Generate pytest tests for the anomalies endpoint. Test that a
+billing queue spike is detected when 6+ BILLING_QUEUE_JOIN events are
+ingested with high queue_depth. Test that CONVERSION_DROP is triggered
+when 20 ENTRY events are ingested with zero purchases. Verify every
+anomaly includes a suggested_action field."
+
+CHANGES MADE: Allow either WARN or CRITICAL severity for queue spike
+depending on queue depth — production thresholds may vary. Used
+setup_method instead of setup_function for class-based tests to ensure
+clean DB state per test. Added gc.collect() in _clean_db() to release
+SQLite file locks on Windows before deleting the database file.
 """
 
 import pytest

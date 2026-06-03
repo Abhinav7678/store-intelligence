@@ -1,8 +1,29 @@
 """
-Tests for detection pipeline covering edge cases:
-group entry, staff exclusion, re-entry, empty store.
-"""
+Tests for the detection pipeline: tracker and event emitter.
 
+Covers critical edge cases from the challenge requirements:
+  - Group entry: 3 people entering together = 3 separate tracks
+  - Staff exclusion: is_staff flag preserved through tracking
+  - Re-entry: same person re-entering gets same visitor_id
+  - Empty store: no detections should not crash
+  - Confidence calibration: low-confidence detections are not suppressed
+  - Schema compliance: TrackedPerson has all fields needed for event emission
+
+PROMPT: "Generate pytest tests for the detection pipeline tracker. Cover
+these edge cases: (1) group entry — 3 simultaneous detections must create
+3 unique tracks, (2) same person tracked across consecutive frames without
+creating a new track, (3) re-entry detection — exited visitor re-entering
+should reuse the same visitor_id, (4) empty frame with no detections should
+not crash, (5) staff flag is preserved. Also test TrackedPerson schema
+compliance for the event emitter."
+
+CHANGES MADE: Added test_confidence_not_suppressed to verify low-confidence
+detections (0.35) still create valid tracks — challenge requires they are
+flagged, not dropped. Added test_zone_tracking_initialized to ensure zone
+fields start as None. Added test_staff_and_customer_separation to explicitly
+verify the is_staff flag distinguishes staff from customers. Adjusted
+re-entry test to populate exited_visitors dict before clearing tracks.
+"""
 import pytest
 import json
 import os
