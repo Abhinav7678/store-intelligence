@@ -1,9 +1,7 @@
 """
-# PROMPT: Generate database initialization for SQLite event storage
-# CHANGES MADE: Simplified to match raw SQLite schema used across all endpoints,
-# extra event fields stored in payload JSON column.
+Database initialization for SQLite event storage.
+Stores all event fields as indexed columns + full JSON payload.
 """
-
 import sqlite3
 import os
 
@@ -21,8 +19,15 @@ def init_db():
             visitor_id TEXT,
             event_type TEXT,
             timestamp TEXT,
+            zone_id TEXT,
+            zone_name TEXT,
+            is_staff INTEGER DEFAULT 0,
             payload TEXT
         )
     """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_store_id ON events(store_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_event_type ON events(event_type)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_visitor_id ON events(visitor_id)")
     conn.commit()
     conn.close()

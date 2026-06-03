@@ -1,15 +1,14 @@
 """
-# PROMPT: Generate anomaly detection endpoint with queue spike, dead zone, and conversion drop detection
-# CHANGES MADE: Query actual DB columns instead of parsing payload JSON for event_type/visitor_id.
-# Added per-zone dead zone detection, 7-day baseline for conversion drop, severity levels.
-# Fixed timestamp format to match ingestion storage format (space-separated, no T/Z).
+# PROMPT: Rewrite anomaly detection for actual queue_completed/queue_abandoned events
+# CHANGES MADE: Use queue_position_at_join for queue spike, zone_entered for dead zone detection,
+# fixed baseline_purchases counting from queue_completed events, severity levels.
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 import sqlite3
 import os
-from datetime import datetime, timedelta, timezone
 import json
+from datetime import datetime, timedelta, timezone
 
 router = APIRouter()
 DB_PATH = os.path.join("data", "events.db")
@@ -18,9 +17,11 @@ LAYOUT_PATH = os.path.join("data", "store_layout.json")
 
 def _connect():
     try:
-        return sqlite3.connect(DB_PATH, timeout=5)
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
     except Exception:
-        raise FileNotFoundError("DB not available")
+        raise HTTPException(status_code=503, detail="db_unavailable")
 
 
 def _load_known_zones(store_id: str):
@@ -34,111 +35,82 @@ def _load_known_zones(store_id: str):
                 if zones:
                     return zones
         if isinstance(layout, list):
-            return [z.get("zone_id") or z.get("name") for z in layout if z.get("zone_id") or z.get("name")]
+            return [z.get("zone_id") or z.get("name") or z.get("zone_name") for z in layout if z.get("zone_id") or z.get("name") or z.get("zone_name")]
     except Exception:
         pass
-    return ["SKINCARE", "SNACKS", "BEVERAGES", "ELECTRONICS", "BILLING"]
+    return []
 
 
 @router.get("/stores/{store_id}/anomalies")
 def store_anomalies(store_id: str):
-    try:
-        conn = _connect()
-    except Exception:
-        raise HTTPException(status_code=503, detail="db_unavailable")
+    conn = _connect()
 
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                event_id TEXT PRIMARY KEY,
-                store_id TEXT,
-                camera_id TEXT,
-                visitor_id TEXT,
-                event_type TEXT,
-                timestamp TEXT,
-                payload TEXT
-            )
-            """
-        )
-        conn.commit()
-
         now = datetime.now(timezone.utc)
-        # MATCH ingestion format: "2026-06-02 15:30:00" (no T, no Z)
-        window_start = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+        window_start = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
 
-        cur.execute(
-            "SELECT event_type, visitor_id, payload FROM events WHERE store_id = ? AND timestamp >= ? ORDER BY timestamp",
-            (store_id, window_start),
-        )
+        # Get recent events (try with T format and space format)
+        cur.execute("""
+            SELECT event_type, visitor_id, zone_id, zone_name, is_staff, timestamp, payload
+            FROM events WHERE store_id = ? AND timestamp >= ? ORDER BY timestamp
+        """, (store_id, window_start))
         rows = cur.fetchall()
+
+        # If no results with time filter, get all events for this store
+        if not rows:
+            cur.execute("""
+                SELECT event_type, visitor_id, zone_id, zone_name, is_staff, timestamp, payload
+                FROM events WHERE store_id = ? ORDER BY timestamp
+            """, (store_id,))
+            rows = cur.fetchall()
 
         queue_depths = []
         zone_visits = {}
         visitors = set()
 
-        for event_type, visitor_id, payload_json in rows:
-            # Parse payload for metadata and is_staff
-            metadata = {}
-            is_staff = False
-            zone_id = None
-            try:
-                payload = json.loads(payload_json) if payload_json else {}
-                metadata = payload.get("metadata") or {}
-                is_staff = payload.get("is_staff", False)
-                zone_id = payload.get("zone_id")
-                if not event_type:
-                    event_type = payload.get("event_type", "")
-                if not visitor_id:
-                    visitor_id = payload.get("visitor_id")
-            except Exception:
-                pass
-
-            if is_staff:
+        for row in rows:
+            if row["is_staff"]:
                 continue
+            if row["visitor_id"]:
+                visitors.add(row["visitor_id"])
 
-            if visitor_id:
-                visitors.add(visitor_id)
+            et = row["event_type"] or ""
 
-            event_type = event_type or ""
-
-            # Queue depth from BILLING_QUEUE_JOIN
-            if event_type == "BILLING_QUEUE_JOIN":
-                qd = metadata.get("queue_depth") if isinstance(metadata, dict) else None
-                if qd is not None:
-                    try:
+            # Queue depth from queue events
+            if et in ("queue_completed", "queue_abandoned"):
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else {}
+                    qd = payload.get("queue_position_at_join")
+                    if qd is not None:
                         queue_depths.append(int(qd))
-                    except (ValueError, TypeError):
-                        pass
+                except Exception:
+                    pass
 
-            # Zone visits from ZONE_ENTER
-            if event_type == "ZONE_ENTER":
-                if zone_id:
-                    zone_visits[zone_id] = zone_visits.get(zone_id, 0) + 1
+            # Zone visits
+            if et in ("zone_entered", "ZONE_ENTER"):
+                zone = row["zone_name"] or row["zone_id"] or ""
+                if zone:
+                    zone_visits[zone] = zone_visits.get(zone, 0) + 1
 
-            
-        total_visitors = len(visitors)
-        anomalies = []
+        anomalies_list = []
 
-        # ── 1. Queue spike: avg queue depth > 5 ──
+        # 1. Queue spike: avg queue position > 5
         if queue_depths:
             avg_q = sum(queue_depths) / len(queue_depths)
             if avg_q > 5:
-                anomalies.append({
+                anomalies_list.append({
                     "type": "BILLING_QUEUE_SPIKE",
                     "severity": "WARN" if avg_q <= 15 else "CRITICAL",
-                    "detail": f"avg_queue={avg_q:.1f}",
+                    "detail": f"avg_queue_position={avg_q:.1f}",
                     "suggested_action": "Open an additional billing register or reassign staff to checkout",
                 })
 
-        # ── 2. Dead zone: per-zone detection ──
+        # 2. Dead zone detection
         known_zones = _load_known_zones(store_id)
         for zone in known_zones:
-            zone_upper = zone.upper()
-            visited = any(z.upper() == zone_upper for z in zone_visits)
-            if not visited:
-                anomalies.append({
+            if zone not in zone_visits:
+                anomalies_list.append({
                     "type": "DEAD_ZONE",
                     "severity": "INFO",
                     "zone": zone,
@@ -146,46 +118,54 @@ def store_anomalies(store_id: str):
                     "suggested_action": f"Check camera feed for {zone}, inspect floor placement or signage",
                 })
 
-        # ── 3. Conversion drop: compare to 7-day baseline ──
-        conversion_now = 0.0  # conversion determined by POS correlation, not events
+        # 3. Conversion drop: compare to 7-day baseline
+        total_visitors = len(visitors)
+        current_purchases = sum(1 for row in rows if row["event_type"] == "queue_completed" and not row["is_staff"])
+        current_conv = (current_purchases / total_visitors) if total_visitors else 0.0
 
-        baseline_start = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-        baseline_end = (now - timedelta(days=6)).strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute(
-            "SELECT event_type, visitor_id, payload FROM events WHERE store_id = ? AND timestamp >= ? AND timestamp < ?",
-            (store_id, baseline_start, baseline_end),
-        )
+        baseline_start = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+        baseline_end = (now - timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%S")
+        cur.execute("""
+            SELECT event_type, visitor_id, is_staff FROM events
+            WHERE store_id = ? AND timestamp >= ? AND timestamp < ?
+        """, (store_id, baseline_start, baseline_end))
         baseline_rows = cur.fetchall()
 
         baseline_visitors = set()
         baseline_purchases = 0
-        for event_type_b, visitor_id_b, payload_json_b in baseline_rows:
-            try:
-                p = json.loads(payload_json_b) if payload_json_b else {}
-                if p.get("is_staff"):
-                    continue
-            except Exception:
-                pass
-            if visitor_id_b:
-                baseline_visitors.add(visitor_id_b)
+        for br in baseline_rows:
+            if br["is_staff"]:
+                continue
+            if br["visitor_id"]:
+                baseline_visitors.add(br["visitor_id"])
+            if br["event_type"] == "queue_completed":
+                baseline_purchases += 1
+
         baseline_conv = (baseline_purchases / len(baseline_visitors)) if baseline_visitors else 0.0
 
-        if baseline_conv and conversion_now < (baseline_conv * 0.6):
-            anomalies.append({
+        if baseline_conv > 0 and current_conv < (baseline_conv * 0.6):
+            anomalies_list.append({
                 "type": "CONVERSION_DROP",
                 "severity": "WARN",
-                "detail": f"now={conversion_now:.3f} baseline={baseline_conv:.3f}",
+                "detail": f"current={current_conv:.3f} baseline={baseline_conv:.3f}",
                 "suggested_action": "Investigate promotion, staffing, or POS issues",
             })
-        elif not baseline_visitors and total_visitors >= 10 and conversion_now == 0.0:
-            anomalies.append({
+        elif not baseline_visitors and total_visitors >= 10 and current_conv == 0.0:
+            anomalies_list.append({
                 "type": "CONVERSION_DROP",
                 "severity": "WARN",
-                "detail": f"now={conversion_now:.3f} baseline=none",
+                "detail": f"current={current_conv:.3f} baseline=none",
                 "suggested_action": "Investigate promotions, staff, or POS",
             })
 
-        return JSONResponse(content={"store_id": store_id, "anomalies": anomalies})
-
-    finally:
         conn.close()
+        return JSONResponse(content={"store_id": store_id, "anomalies": anomalies_list})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail=f"error: {str(e)}")

@@ -1,91 +1,88 @@
 """
 Pydantic schemas for the Store Intelligence API.
-
-Defines request/response models for event ingestion, detection tracking,
-and bounding box geometry. All models use strict validation via Pydantic.
+Accepts the actual challenge event formats: entry/exit, zone, and queue events.
 """
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
 
-class BoundingBox(BaseModel):
-    x: int
-    y: int
-    w: int
-    h: int
-
-
-class Detection(BaseModel):
-    id: Optional[str] = None
-    label: str
-    score: float = Field(..., ge=0.0, le=1.0)
-    bbox: BoundingBox
-
-
-class Track(BaseModel):
-    track_id: str
-    detections: List[Detection]
-    last_seen: str
-
-
-class EventMetadata(BaseModel):
-    queue_depth: Optional[int] = None
-    sku_zone: Optional[str] = None
-    session_seq: Optional[int] = None
-    extra: Optional[Dict[str, Any]] = None
-
-
 class Event(BaseModel):
-    event_id: str
-    store_id: str
-    camera_id: str
-    visitor_id: str
+    """Flexible event model that accepts all 3 event shapes from the challenge data."""
+    # Common
     event_type: str
-    timestamp: str
+
+    # Entry/Exit fields
+    id_token: Optional[str] = None
+    store_code: Optional[str] = None
+    event_timestamp: Optional[str] = None
+    is_staff: Optional[bool] = False
+    gender_pred: Optional[str] = None
+    age_pred: Optional[int] = None
+    is_face_hidden: Optional[bool] = None
+    group_id: Optional[str] = None
+    group_size: Optional[int] = None
+
+    # Zone fields
+    track_id: Optional[Any] = None
+    store_id: Optional[str] = None
+    camera_id: Optional[str] = None
     zone_id: Optional[str] = None
-    dwell_ms: int = 0
-    is_staff: bool = False
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-    metadata: Optional[EventMetadata] = None
+    zone_name: Optional[str] = None
+    zone_type: Optional[str] = None
+    is_revenue_zone: Optional[str] = None
+    event_time: Optional[str] = None
+    zone_hotspot_x: Optional[float] = None
+    zone_hotspot_y: Optional[float] = None
+    gender: Optional[str] = None
+    age: Optional[int] = None
+    age_bucket: Optional[str] = None
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "event_id": "uuid-v4",
-                "store_id": "STORE_BLR_002",
-                "camera_id": "CAM_ENTRY_01",
-                "visitor_id": "VIS_c8a2f1",
-                "event_type": "ZONE_DWELL",
-                "timestamp": "2026-03-03T14:22:10Z",
-                "zone_id": "SKINCARE",
-                "dwell_ms": 8400,
-                "is_staff": False,
-                "confidence": 0.91,
-                "metadata": {"queue_depth": None, "sku_zone": "MOISTURISER", "session_seq": 5}
-            }
-        }
+    # Queue/Billing fields
+    queue_event_id: Optional[str] = None
+    queue_join_ts: Optional[str] = None
+    queue_served_ts: Optional[str] = None
+    queue_exit_ts: Optional[str] = None
+    wait_seconds: Optional[int] = None
+    queue_position_at_join: Optional[int] = None
+    abandoned: Optional[bool] = None
 
+    # Legacy / internal fields (for backward compat)
+    event_id: Optional[str] = None
+    visitor_id: Optional[str] = None
+    timestamp: Optional[str] = None
+    dwell_ms: Optional[int] = 0
+    confidence: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
+    metadata: Optional[Dict[str, Any]] = None
 
-class EventIn(BaseModel):
-    event_id: str
-    store_id: str
-    camera_id: str
-    visitor_id: str
-    event_type: str
-    timestamp: str
-    zone_id: Optional[str] = None
-    dwell_ms: int = 0
-    is_staff: bool = False
-    confidence: float = 1.0
-    metadata: EventMetadata = EventMetadata()
+    model_config = {"extra": "allow"}
+
+    def get_store_id(self) -> str:
+        return self.store_code or self.store_id or ""
+
+    def get_visitor_id(self) -> str:
+        return self.id_token or (str(self.track_id) if self.track_id is not None else "") or self.visitor_id or ""
+
+    def get_timestamp(self) -> str:
+        return self.event_timestamp or self.event_time or self.queue_join_ts or self.timestamp or ""
+
+    def get_event_id(self) -> str:
+        import uuid
+        return self.event_id or self.queue_event_id or str(uuid.uuid4())
+
+    def get_camera_id(self) -> str:
+        return self.camera_id or "UNKNOWN"
+
+    def get_is_staff(self) -> bool:
+        return self.is_staff or False
 
 
 class IngestRequest(BaseModel):
-    events: List[EventIn]
+    events: List[Event]
 
 
 class IngestResponse(BaseModel):
+    status: str
     accepted: int
-    duplicate: int
-    rejected: int
-    errors: List[dict] = []
+    duplicates_ignored: int
+    rejected: List[dict] = []
+    inserted_ids: List[str] = []

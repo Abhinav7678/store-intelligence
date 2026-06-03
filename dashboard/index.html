@@ -39,15 +39,16 @@
         .event:last-child { border-bottom: none; }
         .event.entry { color: #4ecca3; }
         .event.exit { color: #ff6b6b; }
-        .event.dwell { color: #ffd93d; }
-        .event.billing { color: #00d4ff; }
+        .event.zone { color: #ffd93d; }
+        .event.queue { color: #00d4ff; }
     </style>
 </head>
 <body>
     <h1>🏪 Store Intelligence Dashboard</h1>
-    <select id="storeSelect" onchange="window.location.search='?store='+this.value" style="font-size:1.2em; padding:8px; margin:10px; border-radius:8px; background:#1e293b; color:#38bdf8; border:1px solid #38bdf8;">
+    <select id="storeSelect" onchange="window.location.search='?store='+this.value" style="font-size:1.2em; padding:8px; margin:10px; border-radius:8px; background:#1e293b; color:#38bdf8; border:1px solid #334155;">
         <option value="ST1076">Store ST1076 (Mumbai)</option>
         <option value="ST1008">Store ST1008</option>
+        <option value="store_1076">Store store_1076</option>
     </select>
 
     <!-- WebSocket status bar -->
@@ -101,41 +102,25 @@
     <script>
         const STORE_ID = new URLSearchParams(window.location.search).get('store') || "ST1076";
         document.getElementById('storeSelect').value = STORE_ID;
-        const API_BASE = "http://localhost:8000";
+        const API_BASE = window.location.origin;
 
-        // ── Metrics ───────────────────────────────────────────────────────────
+        // ── Metrics ──
         async function fetchMetrics() {
             try {
                 const resp = await fetch(`${API_BASE}/stores/${STORE_ID}/metrics`);
                 const data = await resp.json();
+                document.getElementById("visitors").textContent = data.unique_visitors ?? 0;
+                document.getElementById("conversion").textContent = (data.conversion_rate ?? 0).toFixed(1) + "%";
 
-                // Unique visitors
-                document.getElementById("visitors").textContent =
-                    data.unique_visitors ?? 0;
-
-                // Conversion rate — API already returns as percentage (e.g. 25.0)
-                document.getElementById("conversion").textContent =
-                    (data.conversion_rate ?? 0).toFixed(1) + "%";
-
-                // ✅ Fix 1: avg_dwell_per_zone is a dict, not a single number
                 const zones = data.avg_dwell_per_zone || {};
                 const values = Object.values(zones);
-                const avgDwell = values.length
-                    ? values.reduce((a, b) => a + b, 0) / values.length
-                    : 0;
-                document.getElementById("dwell").textContent =
-                    (avgDwell / 1000).toFixed(0) + "s";
-
-                // ✅ Fix 2: correct field name is queue_depth not avg_queue_depth
-                document.getElementById("queue").textContent =
-                    data.queue_depth ?? 0;
-
-            } catch (e) {
-                console.error("Metrics error:", e);
-            }
+                const avgDwell = values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+                document.getElementById("dwell").textContent = (avgDwell / 1000).toFixed(0) + "s";
+                document.getElementById("queue").textContent = data.queue_depth ?? 0;
+            } catch (e) { console.error("Metrics error:", e); }
         }
 
-        // ── Funnel ────────────────────────────────────────────────────────────
+        // ── Funnel ──
         async function fetchFunnel() {
             try {
                 const resp = await fetch(`${API_BASE}/stores/${STORE_ID}/funnel`);
@@ -143,43 +128,38 @@
                 const container = document.getElementById("funnel");
                 container.innerHTML = "";
 
-                // ✅ Fix 3: API returns data.stages (object) not data.funnel (array)
                 if (data.stages) {
                     const stageLabels = {
-                        entry:         "🚪 Entry",
-                        zone_visit:    "🏪 Zone Visit",
+                        entry: "🚪 Entry",
+                        zone_visit: "🏪 Zone Visit",
                         billing_queue: "🧾 Billing Queue",
-                        purchase:      "💰 Purchase"
+                        purchase: "💰 Purchase"
                     };
                     const max = data.stages.entry?.count || 1;
 
                     Object.entries(data.stages).forEach(([key, val]) => {
                         const barPct = max > 0 ? (val.count / max * 100) : 0;
+                        const dropoff = val.drop_off_pct !== undefined ? ` · drop-off: ${val.drop_off_pct}%` : '';
                         container.innerHTML += `
                             <div class="funnel-bar">
                                 <div class="funnel-fill" style="width:${barPct}%"></div>
                                 <div class="funnel-text">
                                     <span>${stageLabels[key] || key}</span>
-                                    <span>${val.count} visitors &nbsp;·&nbsp; ${val.pct}%</span>
+                                    <span>${val.count} visitors · ${val.pct}%${dropoff}</span>
                                 </div>
                             </div>`;
                     });
 
                     if (data.sessions !== undefined) {
-                        container.innerHTML += `
-                            <div class="sub" style="margin-top:8px">
-                                Total sessions: ${data.sessions}
-                            </div>`;
+                        container.innerHTML += `<div class="sub" style="margin-top:8px">Total sessions: ${data.sessions}</div>`;
                     }
                 } else {
                     container.innerHTML = '<div class="sub">No funnel data yet</div>';
                 }
-            } catch (e) {
-                console.error("Funnel error:", e);
-            }
+            } catch (e) { console.error("Funnel error:", e); }
         }
 
-        // ── Anomalies ─────────────────────────────────────────────────────────
+        // ── Anomalies ──
         async function fetchAnomalies() {
             try {
                 const resp = await fetch(`${API_BASE}/stores/${STORE_ID}/anomalies`);
@@ -192,9 +172,7 @@
                         container.innerHTML += `
                             <div class="anomaly ${(a.severity || '').toLowerCase()}">
                                 <strong>${a.type}</strong>
-                                <span style="float:right;font-size:11px;color:#888">
-                                    ${a.severity}
-                                </span><br>
+                                <span style="float:right;font-size:11px;color:#888">${a.severity}</span><br>
                                 <small style="color:#aaa">${a.detail || ""}</small><br>
                                 <small style="color:#00d4ff">→ ${a.suggested_action || ""}</small>
                             </div>`;
@@ -202,82 +180,70 @@
                 } else {
                     container.innerHTML = '<div class="sub">No anomalies detected ✅</div>';
                 }
-            } catch (e) {
-                console.error("Anomalies error:", e);
-            }
+            } catch (e) { console.error("Anomalies error:", e); }
         }
 
-        // ── Health ────────────────────────────────────────────────────────────
+        // ── Health ──
         async function fetchHealth() {
             try {
                 const resp = await fetch(`${API_BASE}/health`);
                 const data = await resp.json();
                 const container = document.getElementById("health");
-
                 const statusClass = data.status === "OK" ? "ok" : "error";
                 let html = `<span class="status ${statusClass}">${data.status}</span>
-                    <div class="sub" style="margin-top:10px">
-                        Last check: ${data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : "N/A"}
-                    </div>`;
+                    <div class="sub" style="margin-top:10px">Last check: ${data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : "N/A"}</div>`;
 
-                // Show per-store status
                 if (data.stores && Object.keys(data.stores).length > 0) {
                     html += `<div style="margin-top:10px">`;
                     Object.entries(data.stores).forEach(([sid, info]) => {
                         const sc = info.status === "OK" ? "ok" : "stale";
-                        html += `
-                            <div style="margin-top:6px;font-size:12px">
-                                <span class="status ${sc}" style="font-size:10px">
-                                    ${info.status}
-                                </span>
-                                <span style="margin-left:6px;color:#aaa">${sid}</span>
-                                <div style="color:#666;font-size:11px;margin-left:4px">
-                                    lag: ${info.lag_minutes ?? "?"} min
-                                </div>
-                            </div>`;
+                        html += `<div style="margin-top:6px;font-size:12px">
+                            <span class="status ${sc}" style="font-size:10px">${info.status}</span>
+                            <span style="margin-left:6px;color:#aaa">${sid}</span>
+                            <div style="color:#666;font-size:11px;margin-left:4px">lag: ${info.lag_minutes ?? "?"} min</div>
+                        </div>`;
                     });
                     html += `</div>`;
                 }
-
                 container.innerHTML = html;
-            } catch (e) {
-                console.error("Health error:", e);
-            }
+            } catch (e) { console.error("Health error:", e); }
         }
 
-        // ── Refresh loop ──────────────────────────────────────────────────────
+        // ── Refresh loop ──
         async function refresh() {
-            await Promise.all([
-                fetchMetrics(),
-                fetchFunnel(),
-                fetchAnomalies(),
-                fetchHealth()
-            ]);
-            document.getElementById("lastUpdate").textContent =
-                "Last updated: " + new Date().toLocaleTimeString();
+            await Promise.all([fetchMetrics(), fetchFunnel(), fetchAnomalies(), fetchHealth()]);
+            document.getElementById("lastUpdate").textContent = "Last updated: " + new Date().toLocaleTimeString();
         }
 
-        // ── WebSocket live feed ───────────────────────────────────────────────
+        // ── WebSocket live feed ──
         const wsStatusEl = document.getElementById('ws-status');
-        const wsDotEl    = document.getElementById('ws-dot');
-        const eventsEl   = document.getElementById('events');
+        const wsDotEl = document.getElementById('ws-dot');
+        const eventsEl = document.getElementById('events');
 
         function eventClass(type) {
             if (!type) return '';
-            if (type === 'ENTRY') return 'entry';
-            if (type === 'EXIT') return 'exit';
-            if (type.startsWith('ZONE_DWELL')) return 'dwell';
-            if (type.startsWith('BILLING')) return 'billing';
+            const t = type.toLowerCase();
+            if (t === 'entry' || t === 'exit') return t;
+            if (t.startsWith('zone')) return 'zone';
+            if (t.startsWith('queue') || t.startsWith('billing')) return 'queue';
             return '';
         }
 
         function addEventDisplay(ev) {
             const d = document.createElement('div');
-            d.className = `event ${eventClass(ev.event_type)}`;
-            const ts = ev.timestamp
-                ? new Date(ev.timestamp).toLocaleTimeString()
-                : new Date().toLocaleTimeString();
-            d.textContent = `${ts} | ${ev.event_type} | visitor=${ev.visitor_id} | zone=${ev.zone_id || '-'} | conf=${ev.confidence ?? '-'} | staff=${ev.is_staff}`;
+            const et = ev.event_type || '';
+            d.className = `event ${eventClass(et)}`;
+
+            // Extract fields from whichever format arrives
+            const ts_raw = ev.event_timestamp || ev.event_time || ev.queue_join_ts || ev.timestamp;
+            const ts = ts_raw ? new Date(ts_raw).toLocaleTimeString() : new Date().toLocaleTimeString();
+            const vid = ev.id_token || ev.track_id || ev.visitor_id || '-';
+            const zone = ev.zone_name || ev.zone_id || '-';
+            const staff = ev.is_staff ?? false;
+            const gender = ev.gender_pred || ev.gender || '-';
+            const age = ev.age_pred || ev.age || '-';
+
+            d.textContent = `${ts} | ${et} | visitor=${vid} | zone=${zone} | ${gender}/${age} | staff=${staff}`;
             eventsEl.prepend(d);
             while (eventsEl.children.length > 200) {
                 eventsEl.removeChild(eventsEl.lastChild);
@@ -287,6 +253,8 @@
         function handleEvent(ev) {
             if (!ev || ev.is_staff) return;
             addEventDisplay(ev);
+            // Refresh metrics on new events
+            refresh();
         }
 
         function connect() {
@@ -313,7 +281,6 @@
                     if (data && data.echo) return;
                     handleEvent(data);
                 } catch (_) {
-                    // plain text message — show as-is
                     const t = document.createElement('div');
                     t.className = 'event';
                     t.textContent = `${new Date().toLocaleTimeString()} | ${m.data}`;
@@ -322,7 +289,7 @@
             });
         }
 
-        // ── Boot ──────────────────────────────────────────────────────────────
+        // ── Boot ──
         refresh();
         setInterval(refresh, 5000);
         connect();

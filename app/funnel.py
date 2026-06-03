@@ -1,16 +1,14 @@
 """
-# PROMPT: Generate funnel analysis endpoint with session reconstruction and drop-off percentages
-# CHANGES MADE: Added re-entry deduplication to prevent double-counting visitors,
-# POS-based purchase detection via session reconstruction, drop-off percentages per stage.
+# PROMPT: Rewrite funnel endpoint for actual challenge data format with drop-off percentages
+# CHANGES MADE: Use actual event_types (entry/exit/zone_entered/queue_completed/queue_abandoned),
+# de-duplicate re-entries, compute drop-off % between stages.
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 import sqlite3
 import os
-from datetime import datetime, timezone
 import json
-
-from app.sessions import reconstruct_sessions
+from datetime import datetime, timezone
 
 router = APIRouter()
 DB_PATH = os.path.join("data", "events.db")
@@ -18,86 +16,87 @@ DB_PATH = os.path.join("data", "events.db")
 
 def _connect():
     try:
-        return sqlite3.connect(DB_PATH, timeout=5)
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
     except Exception:
-        raise FileNotFoundError("DB not available")
-
-
-def _init_db(conn: sqlite3.Connection):
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS events (
-            event_id TEXT PRIMARY KEY,
-            store_id TEXT,
-            camera_id TEXT,
-            visitor_id TEXT,
-            event_type TEXT,
-            timestamp TEXT,
-            payload TEXT
-        )
-        """
-    )
-    conn.commit()
+        raise HTTPException(status_code=503, detail="db_unavailable")
 
 
 @router.get("/stores/{store_id}/funnel")
 def store_funnel(store_id: str):
-    try:
-        conn = _connect()
-        _init_db(conn)
-    except Exception:
-        raise HTTPException(status_code=503, detail="db_unavailable")
+    conn = _connect()
 
     try:
         cur = conn.cursor()
-        start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute(
-            "SELECT payload FROM events WHERE store_id = ? AND timestamp >= ? ORDER BY timestamp",
-            (store_id, start),
-        )
+        now = datetime.now(timezone.utc)
+        today_prefix = now.strftime("%Y-%m-%d")
+
+        cur.execute("""
+            SELECT event_type, visitor_id, zone_id, zone_name, is_staff, timestamp, payload
+            FROM events WHERE store_id = ? ORDER BY timestamp
+        """, (store_id,))
         rows = cur.fetchall()
 
-        payload_rows = [r[0] for r in rows]
-        sessions = reconstruct_sessions(payload_rows, store_id=store_id)
+        # Build per-visitor session data
+        visitor_data = {}
 
-        # ── Deduplicate re-entry sessions per visitor ──
-        # Challenge requirement: "Re-entries must not double-count a visitor"
-        # If a visitor exits and re-enters, merge all their sessions into one,
-        # preserving the deepest funnel stage reached across all visits.
-        seen = {}
-        for s in sessions:
-            vid = s["visitor_id"]
-            if vid not in seen:
-                seen[vid] = s
-            else:
-                seen[vid]["entered"] = seen[vid]["entered"] or s["entered"]
-                seen[vid]["zone_visit"] = seen[vid]["zone_visit"] or s["zone_visit"]
-                seen[vid]["queued"] = seen[vid]["queued"] or s["queued"]
-                seen[vid]["purchased"] = seen[vid]["purchased"] or s["purchased"]
-        sessions = list(seen.values())
-        # ── End dedup ──
+        for row in rows:
+            if row["is_staff"]:
+                continue
+            vid = row["visitor_id"]
+            if not vid:
+                continue
 
-        total_sessions = len(sessions)
+            if vid not in visitor_data:
+                visitor_data[vid] = {
+                    "entered": False,
+                    "zone_visit": False,
+                    "queued": False,
+                    "purchased": False,
+                }
+
+            et = row["event_type"]
+            if et in ("entry", "ENTRY"):
+                visitor_data[vid]["entered"] = True
+            elif et in ("zone_entered", "ZONE_ENTER"):
+                visitor_data[vid]["zone_visit"] = True
+            elif et in ("queue_completed", "queue_abandoned", "BILLING_QUEUE_JOIN"):
+                visitor_data[vid]["queued"] = True
+                if et == "queue_completed":
+                    visitor_data[vid]["purchased"] = True
+
+        sessions = list(visitor_data.values())
+        total = len(sessions)
+
         entries = sum(1 for s in sessions if s["entered"])
         zone_visits = sum(1 for s in sessions if s["zone_visit"])
-        queue = sum(1 for s in sessions if s["queued"])
-        purchases = sum(1 for s in sessions if s["purchased"])
+        queued = sum(1 for s in sessions if s["queued"])
+        purchased = sum(1 for s in sessions if s["purchased"])
 
         def pct(n):
-            return round((n / total_sessions) * 100, 2) if total_sessions else 0.0
+            return round((n / total) * 100, 2) if total else 0.0
 
+        def dropoff(prev, curr):
+            return round(((prev - curr) / prev) * 100, 2) if prev else 0.0
+
+        conn.close()
         return JSONResponse(content={
             "store_id": store_id,
-            "sessions": total_sessions,
+            "sessions": total,
             "stages": {
-                "entry": {"count": entries, "pct": pct(entries)},
-                "zone_visit": {"count": zone_visits, "pct": pct(zone_visits)},
-                "billing_queue": {"count": queue, "pct": pct(queue)},
-                "purchase": {"count": purchases, "pct": pct(purchases)},
+                "entry": {"count": entries, "pct": pct(entries), "drop_off_pct": 0.0},
+                "zone_visit": {"count": zone_visits, "pct": pct(zone_visits), "drop_off_pct": dropoff(entries, zone_visits)},
+                "billing_queue": {"count": queued, "pct": pct(queued), "drop_off_pct": dropoff(zone_visits, queued)},
+                "purchase": {"count": purchased, "pct": pct(purchased), "drop_off_pct": dropoff(queued, purchased)},
             },
         })
-    finally:
-        conn.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail=f"error: {str(e)}")

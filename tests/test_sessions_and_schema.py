@@ -1,59 +1,70 @@
 """
-Tests for Pydantic schema validation and session reconstruction logic.
-
-Verifies that:
-  1. The Event schema correctly validates a well-formed event payload.
-  2. Session reconstruction properly handles re-entry and exit semantics:
-     an explicit EXIT followed by a new ENTRY creates separate sessions,
-     even for the same visitor_id.
-
-PROMPT: "Generate tests for schema validation using Pydantic Event model
-and session reconstruction. Test that a valid event payload passes
-validation. Test that a visitor who exits and re-enters produces two
-separate sessions — verify the reconstruct_sessions helper handles
-EXIT → ENTRY boundaries correctly."
-
-CHANGES MADE: Added synthetic payload rows to simulate a full visitor
-journey: ENTRY → ZONE_ENTER → EXIT, then a re-entry with ENTRY →
-ZONE_ENTER. Verified that reconstruct_sessions splits these into at
-least 2 sessions based on the explicit EXIT event boundary. Used
-timedelta offsets to ensure timestamps are ordered and realistic.
+# PROMPT: Generate tests for schema validation using actual challenge event format
+# and session reconstruction with entry/exit/zone_entered events.
+# CHANGES MADE: Updated to use model_validate instead of parse_obj. Test events
+# use actual format fields (id_token, store_code, event_timestamp).
 """
-from app.schemas import Event, BoundingBox
+from app.schemas import Event
 from app.sessions import reconstruct_sessions
 from datetime import datetime, timedelta
 import json
 
 
-def test_schema_validation():
+def test_schema_validation_entry():
     ev = {
-        "event_id": "s-1",
-        "store_id": "S1",
-        "camera_id": "C1",
-        "visitor_id": "V1",
-        "event_type": "ENTRY",
-        "timestamp": "2026-03-05T12:00:00Z",
-        "zone_id": None,
-        "dwell_ms": 0,
+        "event_type": "entry",
+        "id_token": "ID_60001",
+        "store_code": "store_1076",
+        "camera_id": "cam1",
+        "event_timestamp": "2026-03-08T18:10:05.120000",
         "is_staff": False,
-        "confidence": 0.7,
-        "metadata": {}
+        "gender_pred": "F",
+        "age_pred": 28,
+        "age_bucket": "25-34",
+        "is_face_hidden": False,
+        "group_id": None,
+        "group_size": None,
     }
-    e = Event.parse_obj(ev)
-    assert e.event_id == "s-1"
+    e = Event.model_validate(ev)
+    assert e.event_type == "entry"
+    assert e.id_token == "ID_60001"
+    assert e.get_store_id() == "store_1076"
+    assert e.get_visitor_id() == "ID_60001"
+
+
+def test_schema_validation_zone():
+    ev = {
+        "event_type": "zone_entered",
+        "track_id": 101,
+        "store_id": "ST1076",
+        "camera_id": "CAM2",
+        "zone_id": "PURPLLE_MUM_1076_Z01",
+        "zone_name": "Left Shelf",
+        "zone_type": "SHELF",
+        "is_revenue_zone": "Yes",
+        "event_time": "2026-03-08T18:10:45.280000",
+        "zone_hotspot_x": 412.6,
+        "zone_hotspot_y": 238.4,
+        "gender": "F",
+        "age": 28,
+        "age_bucket": "25-34",
+    }
+    e = Event.model_validate(ev)
+    assert e.event_type == "zone_entered"
+    assert e.get_visitor_id() == "101"
+    assert e.get_timestamp() == "2026-03-08T18:10:45.280000"
 
 
 def test_reconstruct_sessions_reentry_and_exit():
     now = datetime.utcnow()
     rows = []
-    # first session
-    rows.append(json.dumps({"visitor_id": "V1", "event_type": "ENTRY", "timestamp": (now - timedelta(minutes=40)).isoformat() + "Z"}))
-    rows.append(json.dumps({"visitor_id": "V1", "event_type": "ZONE_ENTER", "zone_id": "A", "timestamp": (now - timedelta(minutes=39)).isoformat() + "Z"}))
-    rows.append(json.dumps({"visitor_id": "V1", "event_type": "EXIT", "timestamp": (now - timedelta(minutes=38)).isoformat() + "Z"}))
-    # re-entry within short time
-    rows.append(json.dumps({"visitor_id": "V1", "event_type": "ENTRY", "timestamp": (now - timedelta(minutes=30)).isoformat() + "Z"}))
-    rows.append(json.dumps({"visitor_id": "V1", "event_type": "ZONE_ENTER", "zone_id": "B", "timestamp": (now - timedelta(minutes=29)).isoformat() + "Z"}))
+    # First session
+    rows.append(json.dumps({"id_token": "V1", "event_type": "entry", "event_timestamp": (now - timedelta(minutes=40)).isoformat()}))
+    rows.append(json.dumps({"track_id": 101, "event_type": "zone_entered", "zone_name": "Left Shelf", "event_time": (now - timedelta(minutes=39)).isoformat()}))
+    rows.append(json.dumps({"id_token": "V1", "event_type": "exit", "event_timestamp": (now - timedelta(minutes=38)).isoformat()}))
+    # Re-entry
+    rows.append(json.dumps({"id_token": "V1", "event_type": "entry", "event_timestamp": (now - timedelta(minutes=30)).isoformat()}))
+    rows.append(json.dumps({"track_id": 102, "event_type": "zone_entered", "zone_name": "Center Display", "event_time": (now - timedelta(minutes=29)).isoformat()}))
 
     sessions = reconstruct_sessions(rows)
-    # Expect two closed sessions because of explicit EXIT then new ENTRY
     assert len(sessions) >= 2

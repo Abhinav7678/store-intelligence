@@ -1,23 +1,9 @@
 """
-Tests for event ingestion idempotency and input validation.
-
-Verifies that:
-  1. Posting the same event batch twice is safe — duplicates are ignored.
-  2. Malformed events cause the entire batch to be rejected (422) by
-     Pydantic validation before any database writes occur.
-
-PROMPT: "Generate pytest tests for idempotent event ingestion — verify
-that posting the same batch twice results in 0 accepted and 2 duplicates
-ignored on the second call. Also test that a batch containing an invalid
-event (missing required fields) is fully rejected with HTTP 422."
-
-CHANGES MADE: Added unique UUID suffix per test run to avoid cross-test
-interference from prior ingested events. Changed assertion field from
-'duplicate' to 'duplicates_ignored' to match actual API response schema.
-Added test_partial_rejection to confirm Pydantic validates the entire
-batch atomically — no partial ingest occurs.
+# PROMPT: Generate pytest tests for idempotent event ingestion using actual
+# challenge format — verify duplicate id_token entry events are ignored.
+# CHANGES MADE: Updated to actual event format with id_token, store_code,
+# event_timestamp. Idempotency uses generated event_id from UUID.
 """
-import os
 import uuid
 from fastapi.testclient import TestClient
 from app.main import app
@@ -26,48 +12,49 @@ client = TestClient(app)
 
 
 def _make_events():
-    uid = uuid.uuid4().hex[:8]
+    uid = uuid.uuid4().hex[:5]
     return [
         {
             "event_id": f"idempo-1-{uid}",
-            "store_id": "STORE_IDEMP_001",
-            "camera_id": "CAM_1",
-            "visitor_id": "V1",
-            "event_type": "ENTRY",
-            "timestamp": "2026-03-04T09:00:00Z",
-            "zone_id": None,
-            "dwell_ms": 0,
+            "event_type": "entry",
+            "id_token": f"ID_{uid}_1",
+            "store_code": "STORE_IDEMP_001",
+            "camera_id": "cam1",
+            "event_timestamp": "2026-03-04T09:00:00.000000",
             "is_staff": False,
-            "confidence": 0.9,
-            "metadata": {}
+            "gender_pred": "M",
+            "age_pred": 30,
+            "age_bucket": "25-34",
+            "is_face_hidden": False,
+            "group_id": None,
+            "group_size": None,
         },
         {
             "event_id": f"idempo-2-{uid}",
-            "store_id": "STORE_IDEMP_001",
-            "camera_id": "CAM_2",
-            "visitor_id": "V2",
-            "event_type": "ENTRY",
-            "timestamp": "2026-03-04T09:01:00Z",
-            "zone_id": None,
-            "dwell_ms": 0,
+            "event_type": "entry",
+            "id_token": f"ID_{uid}_2",
+            "store_code": "STORE_IDEMP_001",
+            "camera_id": "cam1",
+            "event_timestamp": "2026-03-04T09:01:00.000000",
             "is_staff": False,
-            "confidence": 0.8,
-            "metadata": {}
-        }
+            "gender_pred": "F",
+            "age_pred": 25,
+            "age_bucket": "25-34",
+            "is_face_hidden": False,
+            "group_id": None,
+            "group_size": None,
+        },
     ]
 
 
 def test_idempotent_ingest():
     events = _make_events()
-
-    # first ingest
     r1 = client.post("/events/ingest", json={"events": events})
     assert r1.status_code == 200
     b1 = r1.json()
     assert b1["accepted"] == 2
     assert b1["duplicates_ignored"] == 0
 
-    # second ingest (same events): should ignore duplicates
     r2 = client.post("/events/ingest", json={"events": events})
     assert r2.status_code == 200
     b2 = r2.json()
@@ -76,11 +63,10 @@ def test_idempotent_ingest():
 
 
 def test_partial_rejection():
-    """Batch with mix of valid and invalid events — valid ones accepted, bad ones rejected."""
     events = _make_events()
-    bad = events + [{"store_id": "STORE_IDEMP_001"}]  # missing required fields
+    bad = events + [{"store_code": "STORE_IDEMP_001"}]  # missing event_type
     r = client.post("/events/ingest", json={"events": bad})
-    assert r.status_code == 200  # partial success, not 422
+    assert r.status_code == 200
     body = r.json()
-    assert body["accepted"] == 2  # 2 valid events accepted
-    assert len(body["rejected"]) == 1  # 1 bad event rejected
+    assert body["accepted"] == 2
+    assert len(body["rejected"]) == 1

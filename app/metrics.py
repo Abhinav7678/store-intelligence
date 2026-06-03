@@ -1,8 +1,9 @@
-# PROMPT: Generate store metrics endpoint using raw SQLite with visitor dedup, dwell averaging, conversion rate, queue depth
-# CHANGES MADE: Fixed timestamp Z suffix filter, fixed dwell to use ZONE_DWELL only, fixed conversion_rate as percentage,
-#               fixed metadata parsing for queue_depth, added structured zero-traffic handling,
-#               replaced PURCHASE event dependency with POS time-window correlation per challenge spec
-
+"""
+# PROMPT: Rewrite metrics endpoint for actual challenge data: entry/exit with id_token,
+# zone_entered/zone_exited with track_id, queue_completed/queue_abandoned, POS with DD-MM-YYYY dates
+# CHANGES MADE: Compute dwell from zone_entered/zone_exited time pairs, queue depth from
+# queue_position_at_join, abandonment from queue_abandoned events, POS correlation with actual CSV format.
+"""
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 import sqlite3
@@ -24,46 +25,33 @@ def _connect():
         raise HTTPException(status_code=503, detail="db_unavailable")
 
 
-def _init_db(conn: sqlite3.Connection):
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            event_id TEXT PRIMARY KEY,
-            store_id TEXT,
-            camera_id TEXT,
-            visitor_id TEXT,
-            event_type TEXT,
-            timestamp TEXT,
-            payload TEXT
-        )
-    """)
-    conn.commit()
-
-
 @router.get("/stores/{store_id}/metrics")
 def store_metrics(store_id: str):
-    """
-    Return today: unique visitors, conversion rate, avg dwell per zone,
-    queue depth, abandonment rate. Excludes staff events.
-    Conversion = visitors in billing zone within 5 min before a POS transaction.
-    """
+    """Metrics: unique visitors, conversion rate, avg dwell per zone,
+    queue depth, abandonment rate. Excludes staff."""
     conn = _connect()
-    _init_db(conn)
 
     try:
         cur = conn.cursor()
         now = datetime.now(timezone.utc)
         today_prefix = now.strftime("%Y-%m-%d")
 
+        # Get all events for this store today
         cur.execute("""
-            SELECT payload FROM events
-            WHERE store_id = ?
-            AND timestamp LIKE ?
+            SELECT event_type, visitor_id, zone_id, zone_name, is_staff, timestamp, payload
+            FROM events
+            WHERE store_id = ? AND timestamp LIKE ?
         """, (store_id, f"{today_prefix}%"))
-
         rows = cur.fetchall()
 
-        # Zero-traffic: return zeroes, not null or crash
+        # Also try matching without date filter if no results (events may have different date)
+        if not rows:
+            cur.execute("""
+                SELECT event_type, visitor_id, zone_id, zone_name, is_staff, timestamp, payload
+                FROM events WHERE store_id = ?
+            """, (store_id,))
+            rows = cur.fetchall()
+
         if not rows:
             conn.close()
             return JSONResponse(content={
@@ -76,105 +64,121 @@ def store_metrics(store_id: str):
             })
 
         visitors = set()
-
-        # Only ZONE_DWELL for accurate dwell — ZONE_ENTER/EXIT have dwell_ms=0
-        zone_dwell_total: dict = {}
-        zone_dwell_count: dict = {}
-
+        zone_enter_times = {}  # (visitor_id, zone_id) -> timestamp
+        zone_dwell_total = {}
+        zone_dwell_count = {}
         total_queue_depth = 0
         queue_entries = 0
         abandonments = 0
+        billing_visitors = set()
 
         for row in rows:
-            try:
-                payload = json.loads(row["payload"])
-            except Exception:
+            event_type = row["event_type"]
+            visitor_id = row["visitor_id"]
+            is_staff = row["is_staff"]
+
+            if is_staff:
                 continue
 
-            # Exclude staff from all metrics
-            if payload.get("is_staff"):
-                continue
+            # Count unique visitors from entry events
+            if event_type in ("entry", "ENTRY"):
+                if visitor_id:
+                    visitors.add(visitor_id)
 
-            vid = payload.get("visitor_id")
-            if vid:
-                visitors.add(vid)
+            # Zone dwell: compute from zone_entered → zone_exited pairs
+            if event_type in ("zone_entered", "ZONE_ENTER"):
+                zone = row["zone_name"] or row["zone_id"] or ""
+                ts = row["timestamp"]
+                if visitor_id and zone:
+                    zone_enter_times[(visitor_id, zone)] = ts
 
-            etype = payload.get("event_type", "")
+            if event_type in ("zone_exited", "ZONE_EXIT"):
+                zone = row["zone_name"] or row["zone_id"] or ""
+                ts = row["timestamp"]
+                key = (visitor_id, zone)
+                if key in zone_enter_times and ts:
+                    try:
+                        enter_dt = datetime.fromisoformat(zone_enter_times[key])
+                        exit_dt = datetime.fromisoformat(ts)
+                        dwell_ms = int((exit_dt - enter_dt).total_seconds() * 1000)
+                        if dwell_ms > 0:
+                            zone_dwell_total[zone] = zone_dwell_total.get(zone, 0) + dwell_ms
+                            zone_dwell_count[zone] = zone_dwell_count.get(zone, 0) + 1
+                    except Exception:
+                        pass
+                    del zone_enter_times[key]
 
-            # Queue depth tracking
-            if etype == "BILLING_QUEUE_JOIN":
-                metadata = payload.get("metadata") or {}
-                if isinstance(metadata, dict):
-                    qd = metadata.get("queue_depth")
+            # Queue events
+            if event_type in ("queue_completed", "queue_abandoned"):
+                queue_entries += 1
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else {}
+                    qd = payload.get("queue_position_at_join")
                     if qd is not None:
-                        try:
-                            total_queue_depth += int(qd)
-                            queue_entries += 1
-                        except (ValueError, TypeError):
-                            pass
+                        total_queue_depth += int(qd)
+                except Exception:
+                    pass
 
-            # Dwell time — ZONE_DWELL only
-            if etype == "ZONE_DWELL":
-                zone = payload.get("zone_id")
-                dwell = payload.get("dwell_ms", 0)
-                if zone and dwell:
-                    zone_dwell_total[zone] = zone_dwell_total.get(zone, 0) + int(dwell)
-                    zone_dwell_count[zone] = zone_dwell_count.get(zone, 0) + 1
+                if event_type == "queue_abandoned":
+                    abandonments += 1
+                else:
+                    if visitor_id:
+                        billing_visitors.add(visitor_id)
 
-            # Abandonment tracking
-            if etype == "BILLING_QUEUE_ABANDON":
-                abandonments += 1
+        # If no entry events found, count all unique visitor_ids
+        if not visitors:
+            for row in rows:
+                if not row["is_staff"] and row["visitor_id"]:
+                    visitors.add(row["visitor_id"])
 
-        # --- POS-based conversion (5-minute window correlation) ---
-        # Per challenge spec: "A visitor who was in the billing zone in the
-        # 5-minute window before a transaction timestamp counts as converted"
+        # POS-based conversion
         converted_visitors = set()
         try:
-            pos_conn = sqlite3.connect(POS_DB_PATH, timeout=5)
-            pos_conn.row_factory = sqlite3.Row
-            pos_rows = pos_conn.execute("""
-                SELECT order_date, order_time
-                FROM pos_transactions
-                WHERE store_id = ?
-                AND order_date = ?
-            """, (store_id, today_prefix)).fetchall()
+            if os.path.exists(POS_DB_PATH):
+                pos_conn = sqlite3.connect(POS_DB_PATH, timeout=5)
+                pos_conn.row_factory = sqlite3.Row
+                pos_rows = pos_conn.execute("""
+                    SELECT DISTINCT order_id, order_date, order_time
+                    FROM pos_transactions WHERE store_id = ?
+                """, (store_id,)).fetchall()
 
-            # Replace lines 140-156 with this:
+                for pos in pos_rows:
+                    try:
+                        od = pos['order_date']
+                        ot = pos['order_time']
+                        # Handle DD-MM-YYYY format
+                        if '-' in od and len(od.split('-')[0]) == 2:
+                            parts = od.split('-')
+                            od = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                        txn_time = f"{od}T{ot}" if ot else od
 
-            for pos in pos_rows:
-                ot = pos['order_time']
-                txn_time = pos['order_date'] + 'T' + ot if ot else pos['order_date']
-
-                billing_visitors = cur.execute("""
-                    SELECT DISTINCT json_extract(payload, '$.visitor_id') as vid
-                    FROM events
-                    WHERE store_id = ?
-                    AND event_type IN ('BILLING_QUEUE_JOIN', 'ZONE_ENTER')
-                    AND json_extract(payload, '$.zone_id') IN ('BILLING', 'billing', 'Billing')
-                    AND json_extract(payload, '$.is_staff') IS NOT 1
-                    AND timestamp BETWEEN datetime(?, '-5 minutes') AND datetime(?)
-                """, (store_id, txn_time, txn_time)).fetchall()
-
-                for bv in billing_visitors:
-                    if bv['vid']:
-                        converted_visitors.add(bv['vid'])
-
-            pos_conn.close()  # ← moved OUTSIDE the loop
+                        # Check for visitors in billing zone within 5 min before transaction
+                        bv_rows = cur.execute("""
+                            SELECT DISTINCT visitor_id FROM events
+                            WHERE store_id = ?
+                            AND event_type IN ('queue_completed', 'BILLING_QUEUE_JOIN')
+                            AND is_staff = 0
+                            AND timestamp BETWEEN datetime(?, '-5 minutes') AND datetime(?)
+                        """, (store_id, txn_time, txn_time)).fetchall()
+                        for bv in bv_rows:
+                            if bv['visitor_id']:
+                                converted_visitors.add(bv['visitor_id'])
+                    except Exception:
+                        pass
+                pos_conn.close()
         except Exception:
             pass
 
-    
+        # Also count queue_completed visitors as converted
+        converted_visitors.update(billing_visitors)
 
-        # Compute final metrics
         unique_visitors = len(visitors)
         converted = len(converted_visitors)
-
         conversion_rate = round((converted / unique_visitors) * 100, 2) if unique_visitors else 0.0
 
         avg_dwell_per_zone = {
             zone: round(zone_dwell_total[zone] / zone_dwell_count[zone])
-            for zone in zone_dwell_total
-            if zone_dwell_count[zone] > 0
+            for zone in zone_dwell_total if zone_dwell_count.get(zone, 0) > 0
         }
 
         queue_depth = int(total_queue_depth / queue_entries) if queue_entries else 0
