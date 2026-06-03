@@ -1,3 +1,9 @@
+"""
+Pydantic schemas for the Store Intelligence API.
+
+Defines request/response models for event ingestion, detection tracking,
+and bounding box geometry. All models use strict validation via Pydantic.
+"""
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 

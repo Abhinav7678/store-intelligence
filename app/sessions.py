@@ -1,3 +1,10 @@
+"""
+Session reconstruction and purchase attribution module.
+
+Reconstructs visitor sessions from raw event payloads stored in the database,
+then correlates billing-zone presence with POS transaction timestamps to
+determine whether a visitor made a purchase (funnel conversion).
+"""
 from typing import List, Dict, Any
 import json
 import sqlite3
@@ -116,8 +123,7 @@ def reconstruct_sessions(payload_rows: List[str], store_id: str = None) -> List[
         if et == "BILLING_QUEUE_JOIN":
             sess["queued"] = True
             sess["billing_timestamps"].append(ts)
-        if et == "BILLING_PURCHASE":
-            sess["purchased"] = True
+        
         if et == "ZONE_ENTER" and payload.get("zone_id", "").upper() in ("BILLING", "BILLING_COUNTER"):
             sess["billing_timestamps"].append(ts)
         if et == "EXIT":

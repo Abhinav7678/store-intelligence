@@ -76,8 +76,11 @@ def test_idempotent_ingest():
 
 
 def test_partial_rejection():
-    """Batch with invalid events fails Pydantic validation (422) before reaching ingest logic."""
+    """Batch with mix of valid and invalid events — valid ones accepted, bad ones rejected."""
     events = _make_events()
     bad = events + [{"store_id": "STORE_IDEMP_001"}]  # missing required fields
     r = client.post("/events/ingest", json={"events": bad})
-    assert r.status_code == 422  # Pydantic rejects entire batch
+    assert r.status_code == 200  # partial success, not 422
+    body = r.json()
+    assert body["accepted"] == 2  # 2 valid events accepted
+    assert len(body["rejected"]) == 1  # 1 bad event rejected

@@ -162,19 +162,7 @@ def store_metrics(store_id: str):
         except Exception:
             pass
 
-        # Fallback: if POS correlation found nothing, use BILLING_PURCHASE events
-        if not converted_visitors:
-            purchase_rows = cur.execute("""
-                SELECT DISTINCT json_extract(payload, '$.visitor_id') as vid
-                FROM events
-                WHERE store_id = ?
-                AND json_extract(payload, '$.event_type') = 'BILLING_PURCHASE'
-                AND json_extract(payload, '$.is_staff') IS NOT 1
-                AND timestamp LIKE ?
-            """, (store_id, f"{today_prefix}%")).fetchall()
-            for pr in purchase_rows:
-                if pr['vid']:
-                    converted_visitors.add(pr['vid'])
+    
 
         # Compute final metrics
         unique_visitors = len(visitors)

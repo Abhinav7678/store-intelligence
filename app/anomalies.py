@@ -118,10 +118,7 @@ def store_anomalies(store_id: str):
                 if zone_id:
                     zone_visits[zone_id] = zone_visits.get(zone_id, 0) + 1
 
-            # Purchase tracking
-            if event_type == "BILLING_PURCHASE":
-                purchases += 1
-
+            
         total_visitors = len(visitors)
         anomalies = []
 

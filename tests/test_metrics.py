@@ -62,10 +62,13 @@ class TestIngestEndpoint:
         assert resp.status_code == 200
 
     def test_partial_success(self):
-        """Batch with invalid events fails Pydantic validation (422)."""
+        """Batch with mix of valid and invalid events — valid accepted, bad rejected."""
         bad = [make_event(f"i4-{_uid()}", "ENTRY", "V4")] + [{"store_id": "TEST"}]
         resp = client.post("/events/ingest", json={"events": bad})
-        assert resp.status_code == 422
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["accepted"] == 1
+        assert len(body["rejected"]) == 1
 
 
 class TestMetricsEndpoint:
