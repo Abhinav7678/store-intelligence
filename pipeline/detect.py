@@ -193,7 +193,7 @@ class PersonTracker:
                         "last_dwell_frame": {},
                         "frames_unseen": 0,
                         "session_seq": reentry_track.get("session_seq", 0),
-                        "purchased": False
+                        
                     }
                     del self.exited_tracks[reentry_id]
                     matched_tracks.add(track_id)
@@ -220,7 +220,6 @@ class PersonTracker:
                         "last_dwell_frame": {},
                         "frames_unseen": 0,
                         "session_seq": 1,
-                        "purchased": False
                     }
                     matched_tracks.add(track_id)
 
@@ -286,23 +285,7 @@ class PersonTracker:
                         track["session_seq"] += 1
 
                 else:
-                    # Same zone — check BILLING_PURCHASE first
-                    if current_zone == "BILLING" and not track.get("purchased", False):
-                        last_dwell = track["last_dwell_frame"].get("BILLING", track["entry_frame"])
-                        frames_in_billing = frame_idx - last_dwell
-                        fps = 15
-                        ms_in_billing = int(frames_in_billing / fps * 1000)
-                        if ms_in_billing >= self.purchase_dwell_ms:
-                            events.append(self._make_event(
-                                visitor_id=track["visitor_id"],
-                                event_type="BILLING_PURCHASE",
-                                timestamp=timestamp,
-                                zone_id="BILLING",
-                                confidence=float(conf),
-                                session_seq=track["session_seq"]
-                            ))
-                            track["session_seq"] += 1
-                            track["purchased"] = True
+                   
 
                     # Same zone — check ZONE_DWELL (every 30s)
                     last_dwell = track["last_dwell_frame"].get(current_zone, track["entry_frame"])

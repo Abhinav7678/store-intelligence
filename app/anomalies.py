@@ -77,7 +77,6 @@ def store_anomalies(store_id: str):
         queue_depths = []
         zone_visits = {}
         visitors = set()
-        purchases = 0
 
         for event_type, visitor_id, payload_json in rows:
             # Parse payload for metadata and is_staff
@@ -148,7 +147,7 @@ def store_anomalies(store_id: str):
                 })
 
         # ── 3. Conversion drop: compare to 7-day baseline ──
-        conversion_now = (purchases / total_visitors) if total_visitors else 0.0
+        conversion_now = 0.0  # conversion determined by POS correlation, not events
 
         baseline_start = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
         baseline_end = (now - timedelta(days=6)).strftime("%Y-%m-%d %H:%M:%S")
@@ -169,9 +168,6 @@ def store_anomalies(store_id: str):
                 pass
             if visitor_id_b:
                 baseline_visitors.add(visitor_id_b)
-            if (event_type_b or "") == "BILLING_PURCHASE":
-                baseline_purchases += 1
-
         baseline_conv = (baseline_purchases / len(baseline_visitors)) if baseline_visitors else 0.0
 
         if baseline_conv and conversion_now < (baseline_conv * 0.6):
@@ -181,7 +177,7 @@ def store_anomalies(store_id: str):
                 "detail": f"now={conversion_now:.3f} baseline={baseline_conv:.3f}",
                 "suggested_action": "Investigate promotion, staffing, or POS issues",
             })
-        elif not baseline_visitors and total_visitors >= 10 and purchases == 0:
+        elif not baseline_visitors and total_visitors >= 10 and conversion_now == 0.0:
             anomalies.append({
                 "type": "CONVERSION_DROP",
                 "severity": "WARN",
