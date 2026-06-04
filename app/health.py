@@ -15,7 +15,7 @@ DB_PATH = os.path.join("data", "events.db")
 
 # Test store patterns to filter from health display
 TEST_STORE_PATTERN = re.compile(
-    r"^(STORE_CONV_|STORE_IDEMP_|STORE_TEST_|STORE_EDGE_|STORE_BLR_)",
+    r"^(STORE_CONV_|STORE_IDEMP_|STORE_TEST_|STORE_EDGE_)",
     re.IGNORECASE
 )
 

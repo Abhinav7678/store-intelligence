@@ -4,7 +4,37 @@ Accepts the actual challenge event formats: entry/exit, zone, and queue events.
 """
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+# Map sample-format (lowercase) event types → canonical (uppercase) spec types.
+# Canonical types: ENTRY, EXIT, ZONE_ENTER, ZONE_EXIT, ZONE_DWELL,
+#                  BILLING_QUEUE_JOIN, BILLING_QUEUE_ABANDON, REENTRY
+_EVENT_TYPE_ALIASES = {
+    "entry":              "ENTRY",
+    "exit":               "EXIT",
+    "reentry":            "REENTRY",
+    "zone_entered":       "ZONE_ENTER",
+    "zone_exited":        "ZONE_EXIT",
+    "zone_dwell":         "ZONE_DWELL",
+    "queue_joined":       "BILLING_QUEUE_JOIN",
+    "queue_completed":    "BILLING_QUEUE_JOIN",      # treat completed as "did join"
+    "queue_abandoned":    "BILLING_QUEUE_ABANDON",
+}
 
+CANONICAL_EVENT_TYPES = {
+    "ENTRY", "EXIT", "REENTRY",
+    "ZONE_ENTER", "ZONE_EXIT", "ZONE_DWELL",
+    "BILLING_QUEUE_JOIN", "BILLING_QUEUE_ABANDON",
+}
+
+
+def _normalize_event_type(raw: str) -> str:
+    """Convert any event_type to canonical UPPERCASE form.
+    Already-canonical values pass through unchanged."""
+    if not raw:
+        return ""
+    upper = raw.strip().upper()
+    if upper in CANONICAL_EVENT_TYPES:
+        return upper
+    return _EVENT_TYPE_ALIASES.get(raw.strip().lower(), upper)
 
 class Event(BaseModel):
     """Flexible event model that accepts all 3 event shapes from the challenge data."""
@@ -57,15 +87,31 @@ class Event(BaseModel):
     model_config = {"extra": "allow"}
 
     def get_store_id(self) -> str:
-        return self.store_code or self.store_id or ""
+        """Prefer canonical `store_id`; fall back to sample `store_code`."""
+        return self.store_id or self.store_code or ""
 
     def get_visitor_id(self) -> str:
-        return self.id_token or (str(self.track_id) if self.track_id is not None else "") or self.visitor_id or ""
+        """Prefer canonical `visitor_id`; fall back to sample `id_token` / `track_id`."""
+        if self.visitor_id:
+            return self.visitor_id
+        if self.id_token:
+            return self.id_token
+        if self.track_id is not None:
+            return str(self.track_id)
+        return ""
 
     def get_timestamp(self) -> str:
-        return self.event_timestamp or self.event_time or self.queue_join_ts or self.timestamp or ""
+        """Prefer canonical `timestamp`; fall back to sample `event_timestamp` / `event_time` / `queue_join_ts`."""
+        return (
+            self.timestamp
+            or self.event_timestamp
+            or self.event_time
+            or self.queue_join_ts
+            or ""
+        )
 
     def get_event_id(self) -> str:
+        """Prefer canonical `event_id`; fall back to sample `queue_event_id`; else generate uuid."""
         import uuid
         return self.event_id or self.queue_event_id or str(uuid.uuid4())
 
@@ -73,8 +119,11 @@ class Event(BaseModel):
         return self.camera_id or "UNKNOWN"
 
     def get_is_staff(self) -> bool:
-        return self.is_staff or False
+        return bool(self.is_staff)
 
+    def get_event_type(self) -> str:
+        """Normalize event_type to canonical UPPERCASE form for downstream comparison."""
+        return _normalize_event_type(self.event_type)
 
 class IngestRequest(BaseModel):
     events: List[Event]
