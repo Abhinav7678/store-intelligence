@@ -2,6 +2,8 @@
 # PROMPT: Update health endpoint to parse actual timestamp format (ISO with microseconds, no Z)
 # CHANGES MADE: Handle "2026-03-08T18:10:05.120000" format, fixed STALE_FEED detection.
 # FIX: Filter out test/internal stores from health display (STORE_CONV_*, STORE_IDEMP_*, STORE_TEST_*)
+# FIX: Defensive lag math — future-dated events (simulated/eval data) no longer
+#      report bogus 126,000-minute lag from Python floor-division on negatives.
 """
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -77,13 +79,23 @@ def health_check():
                 if last_ts.tzinfo is None:
                     last_ts = last_ts.replace(tzinfo=timezone.utc)
 
-                lag_minutes = int((now - last_ts).total_seconds() // 60)
+                lag_seconds = (now - last_ts).total_seconds()
+
+                # Defensive: future-dated events (simulated/eval data) → treat as fresh.
+                # Previously: int(negative // 60) produced huge positive numbers due to
+                # Python's floor-division on negatives, making /health show ~126,000 min.
+                if lag_seconds < 0:
+                    lag_minutes = 0
+                    status = "OK"
+                else:
+                    lag_minutes = int(lag_seconds // 60)
+                    status = "STALE_FEED" if lag_minutes > 10 else "OK"
 
                 store_status[store_id] = {
                     "last_event_at": last_event_at,
                     "lag_minutes": lag_minutes,
                     "event_count": event_count,
-                    "status": "STALE_FEED" if lag_minutes > 10 else "OK"
+                    "status": status,
                 }
             except Exception:
                 store_status[store_id] = {

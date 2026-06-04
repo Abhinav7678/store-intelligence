@@ -4,6 +4,7 @@
 # de-duplicate re-entries, compute drop-off % between stages.
 # FIX: queue_abandoned counted in billing_queue but NOT purchase — shows real drop-off.
 # queue_joined also counted. Funnel base = entries. Added abandonment stats.
+# STAFF FIX: Set-based staff filter so a visitor flagged on any event is excluded everywhere.
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -38,14 +39,18 @@ def store_funnel(store_id: str):
         """, (store_id,))
         rows = cur.fetchall()
 
+        # ── Set-based staff filter ──
+        staff_visitor_ids = {
+            row["visitor_id"] for row in rows
+            if row["is_staff"] and row["visitor_id"]
+        }
+
         # Build per-visitor session data
         visitor_data = {}
 
         for row in rows:
-            if row["is_staff"]:
-                continue
             vid = row["visitor_id"]
-            if not vid:
+            if not vid or vid in staff_visitor_ids:
                 continue
 
             if vid not in visitor_data:
@@ -72,8 +77,8 @@ def store_funnel(store_id: str):
                 elif et in ("queue_abandoned", "BILLING_QUEUE_ABANDON"):
                     visitor_data[vid]["abandoned"] = True
 
-        # Edge case: visitor who abandoned then re-queued and completed
-        # purchased flag from queue_completed takes precedence — leave as-is
+        # Edge case: visitor who abandoned then re-queued and completed —
+        # purchased flag from queue_completed takes precedence.
 
         sessions = list(visitor_data.values())
         total = len(sessions)

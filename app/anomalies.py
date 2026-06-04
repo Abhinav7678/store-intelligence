@@ -2,6 +2,7 @@
 # PROMPT: Rewrite anomaly detection for actual queue_completed/queue_abandoned events
 # CHANGES MADE: Use queue_position_at_join for queue spike, zone_entered for dead zone detection,
 # fixed baseline_purchases counting from queue_completed events, severity levels.
+# STAFF FIX: Set-based staff filter applied to both current and baseline windows.
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -35,10 +36,22 @@ def _load_known_zones(store_id: str):
                 if zones:
                     return zones
         if isinstance(layout, list):
-            return [z.get("zone_id") or z.get("name") or z.get("zone_name") for z in layout if z.get("zone_id") or z.get("name") or z.get("zone_name")]
+            return [
+                z.get("zone_id") or z.get("name") or z.get("zone_name")
+                for z in layout
+                if z.get("zone_id") or z.get("name") or z.get("zone_name")
+            ]
     except Exception:
         pass
     return []
+
+
+def _staff_set(rows):
+    """Build the set of visitor_ids that were ever flagged as staff in `rows`."""
+    return {
+        row["visitor_id"] for row in rows
+        if row["is_staff"] and row["visitor_id"]
+    }
 
 
 @router.get("/stores/{store_id}/anomalies")
@@ -50,7 +63,7 @@ def store_anomalies(store_id: str):
         now = datetime.now(timezone.utc)
         window_start = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
 
-        # Get recent events (try with T format and space format)
+        # Get recent events
         cur.execute("""
             SELECT event_type, visitor_id, zone_id, zone_name, is_staff, timestamp, payload
             FROM events WHERE store_id = ? AND timestamp >= ? ORDER BY timestamp
@@ -65,16 +78,19 @@ def store_anomalies(store_id: str):
             """, (store_id,))
             rows = cur.fetchall()
 
+        # ── Set-based staff filter ──
+        staff_visitor_ids = _staff_set(rows)
+
         queue_depths = []
         zone_visits = {}
         visitors = set()
 
         for row in rows:
-            if row["is_staff"]:
+            vid = row["visitor_id"]
+            if not vid or vid in staff_visitor_ids:
                 continue
-            if row["visitor_id"]:
-                visitors.add(row["visitor_id"])
 
+            visitors.add(vid)
             et = row["event_type"] or ""
 
             # Queue depth from queue events
@@ -120,7 +136,11 @@ def store_anomalies(store_id: str):
 
         # 3. Conversion drop: compare to 7-day baseline
         total_visitors = len(visitors)
-        current_purchases = sum(1 for row in rows if row["event_type"] == "queue_completed" and not row["is_staff"])
+        current_purchases = sum(
+            1 for row in rows
+            if row["event_type"] == "queue_completed"
+            and row["visitor_id"] not in staff_visitor_ids
+        )
         current_conv = (current_purchases / total_visitors) if total_visitors else 0.0
 
         baseline_start = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -131,13 +151,16 @@ def store_anomalies(store_id: str):
         """, (store_id, baseline_start, baseline_end))
         baseline_rows = cur.fetchall()
 
+        # Baseline window has its own staff set
+        baseline_staff = _staff_set(baseline_rows)
+
         baseline_visitors = set()
         baseline_purchases = 0
         for br in baseline_rows:
-            if br["is_staff"]:
+            vid = br["visitor_id"]
+            if not vid or vid in baseline_staff:
                 continue
-            if br["visitor_id"]:
-                baseline_visitors.add(br["visitor_id"])
+            baseline_visitors.add(vid)
             if br["event_type"] == "queue_completed":
                 baseline_purchases += 1
 

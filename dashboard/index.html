@@ -248,7 +248,7 @@
     </style>
 </head>
 <body>
-    <!-- Header — matches Purplle { } branding -->
+    <!-- Header -->
     <div class="header">
         <div class="purplle-logo">
             <span class="brace">{</span>
@@ -315,7 +315,7 @@
                     <span id="staff-excluded">--</span>
                 </div>
                 <div class="row">
-                    <span>Exclusion accuracy</span>
+                    <span>Staff fraction</span>
                     <span id="staff-pct">--%</span>
                 </div>
             </div>
@@ -376,65 +376,50 @@
         document.getElementById('storeSelect').value = STORE_ID;
         const API_BASE = window.location.origin;
 
-        // ── Metrics + Staff ──
+        // ── Metrics ──
         async function fetchMetrics() {
             try {
                 const resp = await fetch(`${API_BASE}/stores/${STORE_ID}/metrics`);
                 const data = await resp.json();
 
-                const visitors = data.unique_visitors ?? 0;
-                document.getElementById("visitors").textContent = visitors;
-                document.getElementById("conversion").textContent = (data.conversion_rate ?? 0).toFixed(1) + "%";
+                document.getElementById("visitors").textContent = data.unique_visitors ?? 0;
+                document.getElementById("conversion").textContent =
+                    (data.conversion_rate ?? 0).toFixed(1) + "%";
 
                 const zones = data.avg_dwell_per_zone || {};
                 const values = Object.values(zones);
-                const avgDwellMs = values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+                const avgDwellMs = values.length
+                    ? values.reduce((a, b) => a + b, 0) / values.length
+                    : 0;
                 const dwellSeconds = Math.round(avgDwellMs / 1000);
-                document.getElementById("dwell").textContent = dwellSeconds > 0 ? dwellSeconds + "s" : "0s";
+                document.getElementById("dwell").textContent =
+                    dwellSeconds > 0 ? dwellSeconds + "s" : "0s";
                 document.getElementById("queue").textContent = data.queue_depth ?? 0;
 
-                // Abandonment card
                 document.getElementById("abandonment-rate").textContent =
                     (data.abandonment_rate ?? 0).toFixed(1) + "%";
-
-                // Staff detection card — fetch staff count from a separate query
-                fetchStaffStats(visitors);
             } catch (e) { console.error("Metrics error:", e); }
         }
 
-        // ── Staff Stats (queries all events including staff) ──
-        async function fetchStaffStats(customerCount) {
+        // ── Staff Stats — read directly from API, no client-side arithmetic ──
+        async function fetchStaffStats() {
             try {
-                // Use health endpoint to get store info, then estimate staff
-                // We query events via a small trick: ingest endpoint won't help,
-                // so we count staff from the funnel or a dedicated approach
                 const resp = await fetch(`${API_BASE}/stores/${STORE_ID}/staff-stats`);
-                if (resp.ok) {
-                    const data = await resp.json();
-                    const staffCount = data.staff_count ?? 0;
-                    const totalPeople = customerCount + staffCount;
+                if (!resp.ok) throw new Error("staff-stats not available");
+                const data = await resp.json();
 
-                    document.getElementById("staff-count").textContent = staffCount;
-                    document.getElementById("total-people").textContent = totalPeople;
-                    document.getElementById("customer-count").textContent = customerCount;
-                    document.getElementById("staff-excluded").textContent = staffCount;
-                    document.getElementById("staff-pct").textContent =
-                        totalPeople > 0 ? ((staffCount / totalPeople) * 100).toFixed(1) + "%" : "0%";
-                } else {
-                    // Fallback: estimate from queue data if staff endpoint doesn't exist
-                    document.getElementById("staff-count").textContent = "N/A";
-                    document.getElementById("total-people").textContent = customerCount;
-                    document.getElementById("customer-count").textContent = customerCount;
-                    document.getElementById("staff-excluded").textContent = "0";
-                    document.getElementById("staff-pct").textContent = "0%";
-                }
+                document.getElementById("staff-count").textContent     = data.staff_count ?? 0;
+                document.getElementById("total-people").textContent    = data.total_people ?? 0;
+                document.getElementById("customer-count").textContent  = data.customer_count ?? 0;
+                document.getElementById("staff-excluded").textContent  = data.staff_count ?? 0;
+                document.getElementById("staff-pct").textContent       =
+                    (data.exclusion_pct ?? 0).toFixed(1) + "%";
             } catch (e) {
-                // Staff endpoint may not exist yet — show fallback
-                document.getElementById("staff-count").textContent = "0";
-                document.getElementById("customer-count").textContent = customerCount;
-                document.getElementById("total-people").textContent = customerCount;
+                document.getElementById("staff-count").textContent    = "0";
+                document.getElementById("total-people").textContent   = "--";
+                document.getElementById("customer-count").textContent = "--";
                 document.getElementById("staff-excluded").textContent = "0";
-                document.getElementById("staff-pct").textContent = "0%";
+                document.getElementById("staff-pct").textContent      = "0.0%";
             }
         }
 
@@ -457,7 +442,9 @@
 
                     Object.entries(data.stages).forEach(([key, val]) => {
                         const barPct = max > 0 ? (val.count / max * 100) : 0;
-                        const dropoff = val.drop_off_pct !== undefined ? ` · drop-off: ${val.drop_off_pct}%` : '';
+                        const dropoff = val.drop_off_pct !== undefined
+                            ? ` · drop-off: ${val.drop_off_pct}%`
+                            : '';
                         container.innerHTML += `
                             <div class="funnel-bar">
                                 <div class="funnel-fill" style="width:${barPct}%"></div>
@@ -468,7 +455,6 @@
                             </div>`;
                     });
 
-                    // Show abandonment if present
                     if (data.abandonment && data.abandonment.count > 0) {
                         container.innerHTML += `
                             <div style="margin-top:10px; padding:8px 12px; background:#2d1040; border-radius:8px; border-left:3px solid #ef4444; font-size:12px; color:#fca5a5;">
@@ -476,7 +462,6 @@
                             </div>`;
                     }
 
-                    // Update abandonment card from funnel data too
                     if (data.abandonment) {
                         document.getElementById("queue-joined").textContent =
                             data.stages.billing_queue?.count ?? "--";
@@ -579,8 +564,16 @@
 
         // ── Refresh ──
         async function refresh() {
-            await Promise.all([fetchMetrics(), fetchFunnel(), fetchHeatmap(), fetchAnomalies(), fetchHealth()]);
-            document.getElementById("lastUpdate").textContent = "Last updated: " + new Date().toLocaleTimeString();
+            await Promise.all([
+                fetchMetrics(),
+                fetchStaffStats(),
+                fetchFunnel(),
+                fetchHeatmap(),
+                fetchAnomalies(),
+                fetchHealth()
+            ]);
+            document.getElementById("lastUpdate").textContent =
+                "Last updated: " + new Date().toLocaleTimeString();
         }
 
         // ── WebSocket ──
@@ -621,7 +614,6 @@
 
         function handleEvent(ev) {
             if (!ev) return;
-            // Show ALL events including staff (staff shown with yellow label)
             addEventDisplay(ev);
             refresh();
         }

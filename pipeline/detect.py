@@ -4,6 +4,11 @@
 # CHANGES MADE: Fixed queue_joined/queue_completed separation, added REENTRY event type,
 # staff flagging on all events, ZONE_DWELL emission, deduped queue events.
 # Added debounce for exit/reentry flickering and duplicate queue cycles.
+# STAFF FIX: is_staff is now sticky (once True, stays True) and re-evaluated on every
+# matched frame so zone/queue events emit with the correct flag instead of just exit.
+# IDENTITY FIX (Bug #2): zone_* and queue_* events now carry id_token=visitor_id so the
+# same physical person resolves to ONE visitor across entry/zone/queue/exit events.
+# Without this, the funnel saw N entries + M zone-only "ghosts" → 128% Zone Visit.
 """
 
 import json
@@ -20,6 +25,13 @@ try:
 except ImportError:
     print("Warning: OpenCV or YOLOv8 not installed. Install with: pip install -r requirements-cv.txt")
     sys.exit(1)
+
+
+# ── Staff-detection thresholds (AND of strong signals — see DESIGN.md §5) ──
+# Lifted to module level so reviewers can tune without editing class internals.
+STAFF_MIN_DISTINCT_ZONES = 3       # cover ≥3 of ~7 zones
+STAFF_MIN_FRAMES         = 20      # short-clip friendly
+STAFF_MIN_SPAN_FRAMES    = 600     # ~20s @ 30fps source frames
 
 
 class ZoneClassifier:
@@ -110,18 +122,19 @@ class PersonTracker:
         self.exit_timeout_frames = 90
         self.dwell_interval_frames = 450  # ~30s at 15fps
         self.reentry_window_frames = 450
-        # In __init__, change:
-        self.staff_zone_threshold = 3       # cover ≥3 of ~7 zones (was 3 — keep)
-        self.staff_min_frames = 20          # was 50 — short-clip friendly
-        self.staff_min_span_frames = 600    # was 1800 — 20s @ 30fps source frames
+
+        # Staff thresholds (sourced from module-level constants)
+        self.staff_zone_threshold  = STAFF_MIN_DISTINCT_ZONES
+        self.staff_min_frames      = STAFF_MIN_FRAMES
+        self.staff_min_span_frames = STAFF_MIN_SPAN_FRAMES
 
         # ── Debounce state ──
-        self._last_exit_frame = {}          # visitor_id  → frame of last exit
-        self._last_queue_complete_frame = {} # track_id   → frame of last queue_completed
-        self.reentry_cooldown_frames = 450  # 30s at 15fps — suppress flickering reentries
-        self.queue_cooldown_frames = 150    # 10s at 15fps — suppress duplicate queue cycles
-        self._last_zone_change_frame = {}   # track_id   → frame of last zone transition
-        self.zone_change_cooldown = 8       # ~0.5s at 15fps — suppress zone flicker
+        self._last_exit_frame = {}           # visitor_id  → frame of last exit
+        self._last_queue_complete_frame = {} # track_id    → frame of last queue_completed
+        self.reentry_cooldown_frames = 450   # 30s at 15fps — suppress flickering reentries
+        self.queue_cooldown_frames = 150     # 10s at 15fps — suppress duplicate queue cycles
+        self._last_zone_change_frame = {}    # track_id    → frame of last zone transition
+        self.zone_change_cooldown = 8        # ~0.5s at 15fps — suppress zone flicker
 
     def _is_likely_staff(self, track):
         zones_visited = set()
@@ -136,10 +149,19 @@ class PersonTracker:
         long_persistence = (
             len(timestamps) >= self.staff_min_frames
             and (max(timestamps) - min(timestamps)) >= self.staff_min_span_frames
-    )
+        )
 
-             # Both signals required (was OR — biggest fix)
+        # Both signals required (AND of strong signals)
         return many_zones and long_persistence
+
+    def _evaluate_staff_sticky(self, track):
+        """Re-run the heuristic; once a track is staff it stays staff."""
+        if track.get("is_staff"):
+            return True
+        if self._is_likely_staff(track):
+            track["is_staff"] = True
+            return True
+        return False
 
     def _check_reentry(self, bbox, current_frame):
         x1, y1, x2, y2 = bbox
@@ -203,6 +225,8 @@ class PersonTracker:
                 if reentry_track is not None:
                     track_id = self.next_track_id
                     self.next_track_id += 1
+                    # Carry over staff flag from the previous session — sticky across re-entry
+                    inherited_staff = bool(reentry_track.get("is_staff", False))
                     self.active_tracks[track_id] = {
                         "visitor_id": reentry_track["visitor_id"],
                         "history": reentry_track.get("history", []),
@@ -212,7 +236,7 @@ class PersonTracker:
                         "last_dwell_frame": {},
                         "frames_unseen": 0,
                         "session_seq": reentry_track.get("session_seq", 0),
-                        "is_staff": False,
+                        "is_staff": inherited_staff,
                         "in_billing": False,
                         "billing_join_ts": None,
                     }
@@ -223,6 +247,7 @@ class PersonTracker:
                         visitor_id=reentry_track["visitor_id"],
                         timestamp=timestamp,
                         confidence=float(conf),
+                        is_staff=inherited_staff,
                         is_reentry=True,
                     ))
                     self.active_tracks[track_id]["session_seq"] += 1
@@ -245,10 +270,14 @@ class PersonTracker:
                     }
                     matched_tracks.add(track_id)
 
+                    # First-ever entry: heuristic can't fire yet (no history). The
+                    # API ingestion layer will retroactively flag this row once a
+                    # later event in the same batch reports is_staff=True.
                     events.append(self._make_entry_event(
                         visitor_id=visitor_id,
                         timestamp=timestamp,
                         confidence=float(conf),
+                        is_staff=False,
                     ))
                     self.active_tracks[track_id]["session_seq"] += 1
 
@@ -256,8 +285,10 @@ class PersonTracker:
             track["last_bbox"] = bbox
             track["frames_unseen"] = 0
 
-            # Update staff detection continuously
-            track["is_staff"] = self._is_likely_staff(track)
+            # ── STICKY STAFF EVALUATION ──
+            # Re-run heuristic every frame; once True stays True.
+            # Must run BEFORE any event is emitted below so events carry the flag.
+            self._evaluate_staff_sticky(track)
 
             current_zone = zone_classifier.classify(bbox)
             if current_zone and current_zone != "ENTRY":
@@ -282,6 +313,7 @@ class PersonTracker:
                             confidence=float(conf),
                             bbox=bbox,
                             is_staff=track["is_staff"],
+                            visitor_id=track["visitor_id"],          # ← IDENTITY FIX
                         ))
 
                         # If leaving BILLING zone, emit queue_completed
@@ -302,6 +334,7 @@ class PersonTracker:
                                 bbox=bbox,
                                 join_ts=track.get("billing_join_ts", timestamp),
                                 is_staff=track["is_staff"],
+                                visitor_id=track["visitor_id"],      # ← IDENTITY FIX
                             ))
                             track["in_billing"] = False
                             track["billing_join_ts"] = None
@@ -316,6 +349,7 @@ class PersonTracker:
                         confidence=float(conf),
                         bbox=bbox,
                         is_staff=track["is_staff"],
+                        visitor_id=track["visitor_id"],              # ← IDENTITY FIX
                     ))
                     track["last_dwell_frame"][current_zone] = frame_idx
 
@@ -338,6 +372,7 @@ class PersonTracker:
                                 confidence=float(conf),
                                 bbox=bbox,
                                 is_staff=track["is_staff"],
+                                visitor_id=track["visitor_id"],      # ← IDENTITY FIX
                             ))
 
                 # ZONE_DWELL — emit every 30s of continuous dwell
@@ -355,6 +390,7 @@ class PersonTracker:
                             bbox=bbox,
                             dwell_ms=dwell_ms,
                             is_staff=track["is_staff"],
+                            visitor_id=track["visitor_id"],          # ← IDENTITY FIX
                         ))
                         track["last_dwell_frame"][current_zone] = frame_idx
 
@@ -362,14 +398,37 @@ class PersonTracker:
 
             track["history"].append({"zone": current_zone, "frame": frame_idx})
 
-        # Handle lost tracks → exit
+            # Re-evaluate AFTER history append — this is what catches the staff
+            # threshold the moment it's crossed, on the same frame.
+            self._evaluate_staff_sticky(track)
+
         for track_id in list(self.active_tracks.keys()):
             if track_id not in matched_tracks:
                 self.active_tracks[track_id]["frames_unseen"] += 1
 
                 if self.active_tracks[track_id]["frames_unseen"] > self.exit_timeout_frames:
                     track = self.active_tracks[track_id]
-                    is_staff = self._is_likely_staff(track)
+                    # Sticky flag is the source of truth; recompute as a final
+                    # safety net for tracks that barely qualify on the last frame.
+                    is_staff = self._evaluate_staff_sticky(track)
+
+                    # ── DWELL FIX (Bug #4): emit zone_exited for whatever zone
+                    # the visitor was last in, so heatmap dwell pairing works
+                    # for tracks that never zone-switched before timing out.
+                    if track.get("last_zone") and track["last_zone"] != "ENTRY":
+                        events.append(self._make_zone_event(
+                            event_type="zone_exited",
+                            track_id=track_id,
+                            zone_id=track["last_zone"],
+                            zone_name=zone_classifier.zone_names.get(
+                                track["last_zone"], track["last_zone"]
+                            ),
+                            timestamp=timestamp,
+                            confidence=0.85,
+                            bbox=track["last_bbox"],
+                            is_staff=is_staff,
+                            visitor_id=track["visitor_id"],
+                        ))
 
                     # If still in billing when exiting, emit queue_abandoned
                     if track.get("in_billing"):
@@ -383,6 +442,7 @@ class PersonTracker:
                             bbox=track["last_bbox"],
                             join_ts=track.get("billing_join_ts", timestamp),
                             is_staff=is_staff,
+                            visitor_id=track["visitor_id"],          # ← IDENTITY FIX
                         ))
 
                     # Track exit frame for reentry debounce
@@ -400,7 +460,8 @@ class PersonTracker:
                         "last_bbox": track["last_bbox"],
                         "exit_frame": frame_idx,
                         "history": track["history"],
-                        "session_seq": track["session_seq"] + 1
+                        "session_seq": track["session_seq"] + 1,
+                        "is_staff": is_staff,   # carry to potential reentry
                     }
                     del self.active_tracks[track_id]
 
@@ -444,12 +505,14 @@ class PersonTracker:
         }
 
     def _make_zone_event(self, event_type, track_id, zone_id, zone_name, timestamp,
-                         confidence=0.9, bbox=None, dwell_ms=None, is_staff=False):
+                         confidence=0.9, bbox=None, dwell_ms=None, is_staff=False,
+                         visitor_id=None):
         cx = (bbox[0] + bbox[2]) / 2 if bbox else 0
         cy = (bbox[1] + bbox[3]) / 2 if bbox else 0
         evt = {
             "event_type": event_type,
             "track_id": track_id,
+            "id_token": visitor_id,            # ← IDENTITY FIX: same person across event types
             "store_id": self.store_id,
             "camera_id": self.camera_id,
             "zone_id": zone_id,
@@ -470,7 +533,7 @@ class PersonTracker:
 
     def _make_queue_event(self, event_type, track_id, zone_id, timestamp,
                           queue_position=1, confidence=0.9, bbox=None,
-                          join_ts=None, is_staff=False):
+                          join_ts=None, is_staff=False, visitor_id=None):
         cx = (bbox[0] + bbox[2]) / 2 if bbox else 0
         cy = (bbox[1] + bbox[3]) / 2 if bbox else 0
 
@@ -487,6 +550,7 @@ class PersonTracker:
             "queue_event_id": str(uuid.uuid4()),
             "event_type": event_type,
             "track_id": track_id,
+            "id_token": visitor_id,            # ← IDENTITY FIX
             "store_id": self.store_id,
             "camera_id": self.camera_id,
             "zone_id": zone_id,
@@ -517,10 +581,12 @@ class PersonTracker:
         elif event_type in ("ZONE_ENTER", "ZONE_EXIT"):
             return self._make_zone_event(
                 "zone_entered" if event_type == "ZONE_ENTER" else "zone_exited",
-                0, zone_id or "", zone_id or "", timestamp, confidence
+                0, zone_id or "", zone_id or "", timestamp, confidence,
+                visitor_id=visitor_id,
             )
         elif event_type == "BILLING_QUEUE_JOIN":
-            return self._make_queue_event("queue_joined", 0, zone_id or "BILLING", timestamp, queue_depth or 1, confidence)
+            return self._make_queue_event("queue_joined", 0, zone_id or "BILLING", timestamp,
+                                          queue_depth or 1, confidence, visitor_id=visitor_id)
         else:
             return {
                 "event_type": event_type.lower(),
@@ -596,9 +662,28 @@ def process_clip(video_path, camera_id, store_id, layout_path, clip_start_time=N
     cap.release()
 
     # Close remaining active tracks as exits
+        # Close remaining active tracks as exits
     final_ts = (clip_start_time + timedelta(seconds=frame_idx / fps)).isoformat()
     for track_id, track in list(tracker.active_tracks.items()):
-        is_staff = tracker._is_likely_staff(track)
+        # Use sticky flag (re-evaluate as final safety net)
+        is_staff = tracker._evaluate_staff_sticky(track)
+
+        # ── DWELL FIX (Bug #4): close any still-open zone at end of clip
+        # so heatmap dwell pairing works for visitors who never zone-switched.
+        if track.get("last_zone") and track["last_zone"] != "ENTRY":
+            all_events.append(tracker._make_zone_event(
+                event_type="zone_exited",
+                track_id=track_id,
+                zone_id=track["last_zone"],
+                zone_name=zone_classifier.zone_names.get(
+                    track["last_zone"], track["last_zone"]
+                ),
+                timestamp=final_ts,
+                confidence=0.80,
+                bbox=track["last_bbox"],
+                is_staff=is_staff,
+                visitor_id=track["visitor_id"],
+            ))
 
         if track.get("in_billing"):
             all_events.append(tracker._make_queue_event(
@@ -611,6 +696,7 @@ def process_clip(video_path, camera_id, store_id, layout_path, clip_start_time=N
                 bbox=track["last_bbox"],
                 join_ts=track.get("billing_join_ts", final_ts),
                 is_staff=is_staff,
+                visitor_id=track["visitor_id"],          # ← IDENTITY FIX
             ))
 
         all_events.append(tracker._make_exit_event(
@@ -619,15 +705,24 @@ def process_clip(video_path, camera_id, store_id, layout_path, clip_start_time=N
             confidence=0.80,
             is_staff=is_staff,
         ))
-
     # Per-clip summary
     print(f"\n   ✅ Done: {len(all_events)} events from {frame_idx} frames")
     event_types = {}
+    staff_event_count = 0
+    distinct_visitors = set()
     for e in all_events:
         t = e["event_type"]
         event_types[t] = event_types.get(t, 0) + 1
+        if e.get("is_staff"):
+            staff_event_count += 1
+        # Identity-fix sanity check: every event should now have an id_token
+        vid = e.get("id_token") or e.get("visitor_id")
+        if vid:
+            distinct_visitors.add(vid)
     for t, count in sorted(event_types.items()):
         print(f"      {t}: {count}")
+    print(f"      (staff-flagged events: {staff_event_count})")
+    print(f"      (distinct visitor_ids across all event types: {len(distinct_visitors)})")
 
     return all_events
 

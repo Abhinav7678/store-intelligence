@@ -4,6 +4,8 @@
 # CHANGES MADE: Queue depth from queue_joined - queue_completed/abandoned. Reentry counted as entry.
 # Staff excluded. POS correlation with actual CSV format.
 # FIX: Use zone_id as stable key for dwell pairing. Added /staff-stats endpoint.
+# STAFF FIX: Set-based staff filtering — a visitor flagged as staff on ANY event is excluded
+# from all customer counts. /staff-stats no longer double-counts the same visitor as both.
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -26,28 +28,49 @@ def _connect():
         raise HTTPException(status_code=503, detail="db_unavailable")
 
 
+def _staff_visitor_set(cur, store_id: str) -> set:
+    """Return the set of visitor_ids that are staff for this store
+    (anyone with at least one is_staff=1 event)."""
+    rows = cur.execute(
+        "SELECT DISTINCT visitor_id FROM events "
+        "WHERE store_id = ? AND is_staff = 1 "
+        "AND visitor_id IS NOT NULL AND visitor_id != ''",
+        (store_id,),
+    ).fetchall()
+    return {r["visitor_id"] for r in rows}
+
+
 @router.get("/stores/{store_id}/staff-stats")
 def staff_stats(store_id: str):
-    """Return staff vs customer detection counts for the store."""
+    """Return staff vs customer detection counts for the store.
+    A visitor is counted as staff if ANY of their events has is_staff=1.
+    customer_count = all_distinct_visitors − staff_visitors  (no double counting)
+    """
     conn = _connect()
     try:
         cur = conn.cursor()
 
-        staff_row = cur.execute(
-            "SELECT COUNT(DISTINCT visitor_id) as cnt FROM events WHERE store_id = ? AND is_staff = 1",
-            (store_id,)
-        ).fetchone()
-        staff_count = staff_row["cnt"] if staff_row else 0
+        # All distinct visitors for this store
+        all_rows = cur.execute(
+            "SELECT DISTINCT visitor_id FROM events "
+            "WHERE store_id = ? AND visitor_id IS NOT NULL AND visitor_id != ''",
+            (store_id,),
+        ).fetchall()
+        all_visitors = {r["visitor_id"] for r in all_rows}
 
-        cust_row = cur.execute(
-            "SELECT COUNT(DISTINCT visitor_id) as cnt FROM events WHERE store_id = ? AND is_staff = 0",
-            (store_id,)
-        ).fetchone()
-        customer_count = cust_row["cnt"] if cust_row else 0
+        # Staff = anyone flagged on any event
+        staff_visitors = _staff_visitor_set(cur, store_id)
+
+        # Customers = the rest
+        customer_visitors = all_visitors - staff_visitors
+
+        staff_count    = len(staff_visitors)
+        customer_count = len(customer_visitors)
+        total_people   = staff_count + customer_count
 
         staff_events_row = cur.execute(
             "SELECT COUNT(*) as cnt FROM events WHERE store_id = ? AND is_staff = 1",
-            (store_id,)
+            (store_id,),
         ).fetchone()
         staff_events = staff_events_row["cnt"] if staff_events_row else 0
 
@@ -56,10 +79,10 @@ def staff_stats(store_id: str):
             "store_id": store_id,
             "staff_count": staff_count,
             "customer_count": customer_count,
-            "total_people": staff_count + customer_count,
+            "total_people": total_people,
             "staff_events": staff_events,
-            "exclusion_pct": round((staff_count / (staff_count + customer_count)) * 100, 2)
-                if (staff_count + customer_count) > 0 else 0.0,
+            "exclusion_pct": round((staff_count / total_people) * 100, 2)
+                if total_people > 0 else 0.0,
         })
     except HTTPException:
         raise
@@ -74,7 +97,7 @@ def staff_stats(store_id: str):
 @router.get("/stores/{store_id}/metrics")
 def store_metrics(store_id: str):
     """Metrics: unique visitors, conversion rate, avg dwell per zone,
-    queue depth, abandonment rate. Excludes staff."""
+    queue depth, abandonment rate. Excludes staff via set-based filter."""
     conn = _connect()
 
     try:
@@ -107,6 +130,13 @@ def store_metrics(store_id: str):
                 "abandonment_rate": 0.0
             })
 
+        # ── Set-based staff filter ──
+        # A visitor flagged as staff on any event is staff across the board.
+        staff_visitor_ids = {
+            row["visitor_id"] for row in rows
+            if row["is_staff"] and row["visitor_id"]
+        }
+
         visitors = set()
         zone_enter_times = {}
         zone_dwell_total = {}
@@ -120,9 +150,9 @@ def store_metrics(store_id: str):
         for row in rows:
             event_type = row["event_type"]
             visitor_id = row["visitor_id"]
-            is_staff = row["is_staff"]
 
-            if is_staff:
+            # Skip every row of any visitor flagged as staff
+            if visitor_id in staff_visitor_ids:
                 continue
 
             # Count unique visitors from entry AND reentry events
@@ -171,11 +201,12 @@ def store_metrics(store_id: str):
                 elif event_type == "queue_completed":
                     billing_visitors.add(visitor_id)
 
-        # If no entry events found, count all unique visitor_ids
+        # If no entry events found, count all unique non-staff visitor_ids
         if not visitors:
             for row in rows:
-                if not row["is_staff"] and row["visitor_id"]:
-                    visitors.add(row["visitor_id"])
+                vid = row["visitor_id"]
+                if vid and vid not in staff_visitor_ids:
+                    visitors.add(vid)
 
         # POS-based conversion
         converted_visitors = set()
@@ -205,8 +236,9 @@ def store_metrics(store_id: str):
                             AND timestamp BETWEEN datetime(?, '-5 minutes') AND datetime(?)
                         """, (store_id, txn_time, txn_time)).fetchall()
                         for bv in bv_rows:
-                            if bv['visitor_id']:
-                                converted_visitors.add(bv['visitor_id'])
+                            vid = bv['visitor_id']
+                            if vid and vid not in staff_visitor_ids:
+                                converted_visitors.add(vid)
                     except Exception:
                         pass
                 pos_conn.close()
