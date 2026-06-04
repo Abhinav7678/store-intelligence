@@ -15,14 +15,13 @@ _EVENT_TYPE_ALIASES = {
     "zone_exited":        "ZONE_EXIT",
     "zone_dwell":         "ZONE_DWELL",
     "queue_joined":       "BILLING_QUEUE_JOIN",
-    "queue_completed":    "BILLING_QUEUE_JOIN",      # treat completed as "did join"
-    "queue_abandoned":    "BILLING_QUEUE_ABANDON",
+    "queue_completed":    "BILLING_QUEUE_COMPLETE",     
 }
 
 CANONICAL_EVENT_TYPES = {
     "ENTRY", "EXIT", "REENTRY",
     "ZONE_ENTER", "ZONE_EXIT", "ZONE_DWELL",
-    "BILLING_QUEUE_JOIN", "BILLING_QUEUE_ABANDON",
+    "BILLING_QUEUE_COMPLETE", "BILLING_QUEUE_ABANDON",
 }
 
 

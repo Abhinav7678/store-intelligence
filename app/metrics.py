@@ -6,6 +6,9 @@
 # FIX: Use zone_id as stable key for dwell pairing. Added /staff-stats endpoint.
 # STAFF FIX: Set-based staff filtering — a visitor flagged as staff on ANY event is excluded
 # from all customer counts. /staff-stats no longer double-counts the same visitor as both.
+# DWELL FIX: End-of-session fallback — close any zone_entered with no matching zone_exited
+# against the visitor's last seen timestamp. Mirrors the fallback in heatmap.py so the
+# Avg Dwell Time tile and the heatmap card now show consistent numbers.
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -147,6 +150,9 @@ def store_metrics(store_id: str):
         abandonments = 0
         billing_visitors = set()
 
+        # Track the last seen timestamp per visitor (used by the dwell fallback below).
+        last_event_ts = {}
+
         for row in rows:
             event_type = row["event_type"]
             visitor_id = row["visitor_id"]
@@ -154,6 +160,10 @@ def store_metrics(store_id: str):
             # Skip every row of any visitor flagged as staff
             if visitor_id in staff_visitor_ids:
                 continue
+
+            # Record last seen timestamp for the dwell fallback
+            if visitor_id and row["timestamp"]:
+                last_event_ts[visitor_id] = row["timestamp"]
 
             # Count unique visitors from entry AND reentry events
             if event_type in ("entry", "ENTRY", "reentry", "REENTRY"):
@@ -200,6 +210,25 @@ def store_metrics(store_id: str):
                     abandonments += 1
                 elif event_type == "queue_completed":
                     billing_visitors.add(visitor_id)
+
+        # ── DWELL FIX: end-of-session fallback ──
+        # For any zone_entered that never got a matching zone_exited (e.g. clip ended,
+        # track timed out, or visitor exited the store while still in zone), close
+        # the dwell against the visitor's last observed timestamp. Mirrors the
+        # fallback in app/heatmap.py so the tile and the heatmap card agree.
+        for (vid, zone_key), enter_ts in zone_enter_times.items():
+            close_ts = last_event_ts.get(vid)
+            if not (enter_ts and close_ts):
+                continue
+            try:
+                enter_dt = datetime.fromisoformat(enter_ts)
+                close_dt = datetime.fromisoformat(close_ts)
+                dwell_ms = int((close_dt - enter_dt).total_seconds() * 1000)
+                if dwell_ms > 0:
+                    zone_dwell_total[zone_key] = zone_dwell_total.get(zone_key, 0) + dwell_ms
+                    zone_dwell_count[zone_key] = zone_dwell_count.get(zone_key, 0) + 1
+            except Exception:
+                pass
 
         # If no entry events found, count all unique non-staff visitor_ids
         if not visitors:
