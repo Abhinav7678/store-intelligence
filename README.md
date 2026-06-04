@@ -1,6 +1,6 @@
 # Store Intelligence — AI-Powered Retail Analytics
 
-End-to-end system that turns raw retail CCTV into live operational intelligence: visitor counting, conversion funnels, zone heatmaps, queue analytics, and anomaly alerts — all served through a containerized REST API + WebSocket dashboard.
+End-to-end system that turns raw retail CCTV into live operational intelligence: visitor counting, conversion funnels, zone heatmaps, queue analytics, and anomaly alerts — all served through a containerised FastAPI backend with a real-time HTML dashboard.
 
 ---
 
@@ -21,6 +21,35 @@ To populate the dashboard with data, see [Running the Detection Pipeline](#-runn
 
 ---
 
+## 🎬 Live Dashboard Demo
+
+Real-time KPIs, funnel chart, queue depth and anomaly alerts updating as detection events flow through the WebSocket fan-out (`/ws`):
+
+![Store Intelligence Dashboard — Live Demo](docs/media/dashboard-demo.gif)
+
+> The dashboard is a single-file HTML app served by FastAPI on port 8000. It re-pulls `/stores/{id}/metrics`, `/funnel`, `/heatmap`, and `/anomalies` on every WebSocket push so every tile reflects the live event stream. See [DESIGN.md §1.3](./DESIGN.md) for details.
+
+---
+
+## 📦 Submission Deliverable: Event Log
+
+The event log produced by running the detection pipeline against the provided CCTV clips is committed at:
+
+- **`data/processed/all_events.jsonl`** — combined log across all stores/cameras (893 events)
+- **`data/processed/<STORE>_<CAM>_events.jsonl`** — per-camera breakdowns (8 files)
+
+Schema follows `data/sample_events.jsonl`. To regenerate from clips:
+```bash
+python pipeline/detect.py --all --layout data/store_layout.json
+```
+
+To replay into the running API:
+```bash
+python pipeline/emit.py --input data/processed/all_events.jsonl --api_url http://localhost:8000
+```
+
+---
+
 ## 📋 What This Does
 
 | Stage | Component | Output |
@@ -30,9 +59,9 @@ To populate the dashboard with data, see [Running the Detection Pipeline](#-runn
 | 3 | Aggregation endpoints | Live metrics, funnel, heatmap, anomalies |
 | 4 | HTML dashboard | Real-time KPI tiles + funnel chart |
 
-**Event types (9 canonical):** `ENTRY`, `EXIT`, `REENTRY`, `ZONE_ENTER`, `ZONE_EXIT`, `ZONE_DWELL`, `BILLING_QUEUE_JOIN`, `BILLING_QUEUE_COMPLETE`, `BILLING_QUEUE_ABANDON`
+**Event types:** 8 spec-mandated (`ENTRY`, `EXIT`, `REENTRY`, `ZONE_ENTER`, `ZONE_EXIT`, `ZONE_DWELL`, `BILLING_QUEUE_JOIN`, `BILLING_QUEUE_ABANDON`) plus `BILLING_QUEUE_COMPLETE` (added — needed to make the funnel monotonic; see [DESIGN.md §3.5](./DESIGN.md)).
 
-The pipeline emits the sample-data lowercase form (`entry`, `zone_entered`, `queue_joined`, `queue_completed`, `queue_abandoned`) and the API normalizes to canonical UPPERCASE on ingest — see [DESIGN.md §3.5](./DESIGN.md#35-wire-format-lowercase-events-on-the-pipeline-canonical-uppercase-in-the-api).
+The pipeline emits the sample-data lowercase form (`entry`, `zone_entered`, `queue_joined`, `queue_completed`, `queue_abandoned`) and the API normalizes to canonical UPPERCASE on ingest.
 
 ---
 
@@ -101,10 +130,11 @@ The detection pipeline runs on the **host** (not in Docker) because it needs Ope
 ### 0. Prerequisites
 ```bash
 # Python 3.10+ in a venv
-python -m venv nv
-# Windows: nv\Scripts\activate     |  Linux/Mac: source nv/bin/activate
+python -m venv .venv
+# Windows: .venv\Scripts\activate     |  Linux/Mac: source .venv/bin/activate
 pip install -r requirements.txt -r requirements-cv.txt
 ```
+> On first run, `ultralytics` will auto-download `yolov8n.pt` (~6 MB) into the project root. No manual setup required.
 
 ### 1. Drop your CCTV clips into `data/CCTV Footage/<store>/`
 Examples:
@@ -119,7 +149,7 @@ Camera-to-store mapping is configured in `data/store_layout.json` (committed sam
 
 ### 2. Load POS transactions (one-off)
 ```bash
-python pipeline/load_pos.py "data/POS - sample transactions.csv"
+python pipeline/load_pos.py "data/pos_transactions.csv"
 ```
 
 ### 3. Run detection on all stores
@@ -174,12 +204,20 @@ store-intelligence/
 ├── dashboard/
 │   └── index.html          # Live HTML dashboard
 ├── tests/                  # pytest suite (~78% coverage on app/)
-├── DESIGN.md               # Architecture + edge cases + AI decisions
-├── CHOICES.md              # 3 deep-dive technical decisions
+├── docs/
+│   └── media/
+│       └── dashboard-demo.gif   # Live dashboard recording
 ├── data/
-│   ├── store_layout.json   # Zone polygons + camera mappings (sample committed)
-│   ├── events.db           # Event store (gitignored, regenerated)
-│   └── store_intelligence.db  # POS data (gitignored)
+│   ├── pos_transactions.csv     # POS reference data (committed)
+│   ├── sample_events.jsonl      # Reference event schema (provided)
+│   ├── store_layout.json        # Zone polygons + camera mappings
+│   ├── processed/
+│   │   ├── all_events.jsonl     # 📦 Submission deliverable: combined event log
+│   │   └── <STORE>_<CAM>_events.jsonl  # Per-camera event logs
+│   ├── events.db                # Event store (gitignored, regenerated)
+│   └── store_intelligence.db    # POS DB (gitignored, regenerated)
+├── DESIGN.md               # Architecture + edge cases + AI decisions
+├── CHOICES.md              # 3 deep-dive technical decisions + 1 bonus
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
@@ -205,7 +243,7 @@ Every test file begins with a `# PROMPT: ... # CHANGES MADE: ...` header recordi
 Documented in detail in [DESIGN.md §4](./DESIGN.md#4-edge-case-handling). Summary:
 
 - **Group entry** — per-person tracking, 200-px match radius keeps close-spaced people separate
-- **Staff exclusion** — behavioural heuristic, **clip-tuned** thresholds: ≥3 distinct zones AND ≥20 detection frames AND ≥600 source frames (~40 s @ 15 fps); sticky flag with retroactive backfill on ingest. ~21% staff fraction across both stores; was ~40% under earlier OR-rule. Production deployments would scale up to ≥5 zones / ≥5 min — see [DESIGN.md §5.5](./DESIGN.md#55-production-scaling).
+- **Staff exclusion** — behavioural heuristic, **clip-tuned** thresholds: ≥3 distinct zones AND ≥20 detection frames AND ≥600 source frames (~40 s @ 15 fps); sticky flag with retroactive backfill on ingest
 - **Re-entry** — 30 s spatial-match window emits `REENTRY` reusing visitor_id (suppresses inflation)
 - **Partial occlusion** — `conf=0.35`; low-conf detections kept and flagged via `is_face_hidden`
 - **Queue buildup** — live `queue_depth`, `queue_joined`/`completed`/`abandoned` events with positions
@@ -214,7 +252,7 @@ Documented in detail in [DESIGN.md §4](./DESIGN.md#4-edge-case-handling). Summa
 - **Duplicate ingest** — `event_id` PK constraint + `duplicates_ignored` in response
 - **Stale feed** — `/health` flags any store with no events in last 10 min
 - **DB unavailable** — HTTP 503 with structured body, no stack traces
-- **Camera overlap** — mitigated by camera-role separation in `store_layout.json` (entry / floor / billing cameras cover distinct areas); no cross-camera ReID — see [DESIGN.md §9](./DESIGN.md#9-known-limitations)
+- **Camera overlap** — mitigated by camera-role separation in `store_layout.json` (entry / floor / billing cameras cover distinct areas); no cross-camera ReID — see [DESIGN.md §9](./DESIGN.md)
 
 ---
 
@@ -224,7 +262,7 @@ Documented in detail in [DESIGN.md §4](./DESIGN.md#4-edge-case-handling). Summa
 - **Claude (Anthropic)** — architecture decisions, edge-case analysis, staff-detection trade-offs
 - **ChatGPT** — documentation drafting, test scenario brainstorming
 
-Every test file has a `# PROMPT:` header recording the prompt and what was kept/changed. Three high-impact AI suggestions where I deviated are documented in [DESIGN.md §6](./DESIGN.md#6-ai-assisted-decisions) and [CHOICES.md](./CHOICES.md).
+Every test file has a `# PROMPT:` header recording the prompt and what was kept/changed. Three high-impact AI suggestions where I deviated are documented in [DESIGN.md §6](./DESIGN.md).
 
 ---
 

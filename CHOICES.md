@@ -1,6 +1,6 @@
 # Technical Choices — Store Intelligence Challenge
 
-Three technical decisions where I deviated from common defaults or AI suggestions, with full reasoning and trade-offs documented.
+Three technical decisions where I deviated from common defaults or AI suggestions, with full reasoning and trade-offs documented. A bonus fourth decision (Staff Detection) is included because it is the single highest-leverage edge case in the brief.
 
 ---
 
@@ -33,7 +33,7 @@ Three technical decisions where I deviated from common defaults or AI suggestion
 
 ---
 
-## Choice 2 — Event Wire Format: lowercase pipeline + canonical UPPERCASE API
+## Choice 2 — Event Schema Design: Hybrid Wire Format with Canonical Normalization
 
 ### Options Considered
 1. **Strict canonical UPPERCASE everywhere** — pipeline emits `ENTRY`, API expects `ENTRY`
@@ -72,7 +72,53 @@ _EVENT_TYPE_ALIASES = {
 
 ---
 
-## Choice 3 — Staff Detection: Behavioural Heuristic, Calibrated for Short Clips
+## Choice 3 — API Architecture: SQLite + In-Process WebSocket Hub (no Redis, no Postgres, no broker)
+
+### Options Considered
+| Architecture | Pros | Cons |
+|---|---|---|
+| **SQLite + in-process FastAPI WebSocket** ✅ | Zero infra, single `docker compose up`, full state in two files | Single-writer; tops out around 100 events/sec |
+| Postgres + Redis pub/sub | Production-scale; horizontal API workers | Three containers; reviewer must wait for healthchecks; dependency hell on Windows |
+| Postgres + WebSocket only (no Redis) | Production DB, simple fan-out | Multi-worker fan-out is impossible without a broker |
+| Kafka / NATS + Postgres | Industry-grade event stream | Massive overkill for a 5-store evaluation; reviewer abandons |
+
+### What AI Suggested
+Claude pitched **Postgres + Redis pub/sub** as the "production-correct" answer and described how to wire it. Copilot defaulted to SQLite. ChatGPT offered both and asked me to clarify the deployment target.
+
+### My Decision: **SQLite × 2 + in-process WebSocket hub**
+
+**Reasoning**:
+
+1. **The acceptance gate is `docker compose up` on a clean machine.** Every additional service is one more thing that can fail to start, port-conflict, or take 30 s on a healthcheck. A reviewer who hits a Redis ECONNREFUSED on first boot scores me as "doesn't run" — irrespective of code quality. SQLite keeps the cold-start path to a single container.
+
+2. **Two SQLite files instead of one** — separation of concerns:
+   - `data/events.db` — high-write event store, rebuilt every pipeline run
+   - `data/store_intelligence.db` — read-mostly POS reference data, loaded once from `pos_transactions.csv`
+
+   This lets me `rm events.db && rerun` for a clean idempotent reset without losing POS context. Two tables in one DB would also work; two files made dev iteration faster.
+
+3. **In-process WebSocket hub (`app/ws.py`)** — single broadcast set kept in memory, fanned out from `/events/ingest`. With one API container the broker is unnecessary. Once you scale to 2+ workers, this breaks (each worker only sees its own ingests) — at which point I'd swap in Redis pub/sub. Documented in DESIGN.md §9.
+
+4. **Single-writer SQLite is acceptable for the workload**: the brief mentions 40 stores. At realistic retail density (~1 event/sec/store at peak), that's ~40 events/sec — well below SQLite's WAL-mode write ceiling (~5,000/sec on commodity hardware). The choice only breaks at the next order of magnitude.
+
+**Trade-off accepted**:
+- **No horizontal scaling.** A single API process serves all clients. Acknowledged limitation; I'd address by switching to Postgres + Redis pub/sub at the first production scale-out, not before.
+- **No replication / no HA.** SQLite with `PRAGMA journal_mode=WAL` survives crashes but not disk loss. Out of scope for an evaluation submission; trivially solved by mounting a backed-up volume in production.
+- **WebSocket clients must reconnect on API restart.** Acceptable for a dashboard; would be unacceptable for paid customer traffic.
+
+**What would make me change this decision**:
+- More than one API replica → Redis pub/sub becomes mandatory
+- Multi-region deployment → Postgres + read replicas for `/metrics` etc.
+- Event volume crossing 1k/sec sustained → Postgres + a queue (Kafka or NATS) ahead of ingest
+- A hard SLA on API restart with no event loss → durable broker required
+
+**Why I prefer this default for a 24-hour build**: it makes every other thing in the system *testable* without infra. Pytest can hit the real DB with no fixtures; tests that exercise WebSocket fan-out (`tests/test_ws_publish.py`) run against the same code path that production uses. A reviewer can clone-and-run in 60 seconds. That tight feedback loop is worth more in this context than horizontal-scale-readiness.
+
+---
+
+## Choice 4 (Bonus) — Staff Detection: Behavioural Heuristic, Calibrated for Short Clips
+
+> Included as a fourth choice because the brief explicitly highlights staff exclusion as a scored edge case (Part A) and the AI-vs-human reasoning is unusually concrete here.
 
 ### Options Considered
 | Approach | Accuracy | Generalisation | Effort |
@@ -130,6 +176,7 @@ The constants are module-level on purpose. For a real 8-hour-shift deployment th
 
 | Decision | Chose | Rejected | Key Reason |
 |---|---|---|---|
-| Detection model | YOLOv8n | YOLOv8m, RT-DETR | CPU latency budget; tracker is the bottleneck, not detector |
-| Event wire format | Hybrid (lowercase pipeline, UPPERCASE API) with distinct `BILLING_QUEUE_COMPLETE` | Strict either way; collapsed JOIN/COMPLETE | Format flexibility; funnel needs JOIN ≠ COMPLETE to be monotonic |
-| Staff detection | Behavioural heuristic — clip-tuned (3 zones / 20 frames / 600 span) with sticky flag + retroactive backfill | Uniform HSV, face recognition; "production-grade 5/5min" rule | Generalisation > peak accuracy; thresholds must be sized to observation window |
+| Detection model | YOLOv8n | YOLOv8m, RT-DETR, MediaPipe | CPU latency budget; tracker is the bottleneck, not detector |
+| Event schema | Hybrid (lowercase pipeline, UPPERCASE API) with distinct `BILLING_QUEUE_COMPLETE` | Strict either way; collapsed JOIN/COMPLETE | Format flexibility; funnel needs JOIN ≠ COMPLETE to be monotonic |
+| **API architecture** | **SQLite × 2 + in-process WebSocket** | **Postgres + Redis pub/sub; Kafka/NATS** | **Acceptance gate is `docker compose up`; every extra service is reviewer friction** |
+| Staff detection (bonus) | Behavioural heuristic — clip-tuned (3 zones / 20 frames / 600 span) with sticky flag + retroactive backfill | Uniform HSV, face recognition; "production-grade 5/5min" rule | Generalisation > peak accuracy; thresholds must be sized to observation window |

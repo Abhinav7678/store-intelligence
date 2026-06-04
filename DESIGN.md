@@ -14,13 +14,14 @@ CCTV Footage ─► Detection Pipeline ─► Event Stream ─► REST API + Web
 - **Tracker**: Lightweight distance-based associator with re-ID window (no DeepSORT, no embeddings)
 - **Direction inference**: For fixed-mount cameras, first detection of a track = `entry`, track timeout = `exit`. Optical-flow direction tracking was considered but rejected for this challenge — with cameras pointed straight at the threshold, every track's lifetime *is* the entry→exit traversal, and adding flow estimation would just add latency without changing the events emitted. For wider angles or thresholdless doorways, vector-direction inference would be required.
 - **Zone classifier**: Maps bounding-box centers to named zones from `data/store_layout.json`
-- **Event emitter**: Produces 9 canonical event types (lowercase wire format, normalized to UPPERCASE on ingest)
+- **Event emitter**: Produces the **8 spec-mandated event types** plus `BILLING_QUEUE_COMPLETE` (the queue analogue of `EXIT` — see §3.5 for why this is necessary for funnel correctness). Wire format is the lowercase form shown in `data/sample_events.jsonl`; the API normalizes to canonical UPPERCASE on ingest.
+- **Submission deliverable**: The pipeline output for the provided CCTV clips is committed at **`data/processed/all_events.jsonl`** (combined, 893 events) and per-camera JSONL files alongside it. Reviewers can diff this directly against the spec schema or replay it through the API via `pipeline/emit.py`.
 
 ### 1.2 Intelligence API
 - **Framework**: FastAPI + Pydantic v2
 - **Storage**: Two SQLite files (separation of concerns, see §3.4)
   - `data/events.db` — visitor / zone / queue events (high write rate)
-  - `data/store_intelligence.db` — POS transactions (read-mostly reference data)
+  - `data/store_intelligence.db` — POS transactions, loaded once from `data/pos_transactions.csv` (read-mostly reference data)
 - **Mandatory endpoints** (per spec): `/events/ingest`, `/stores/{id}/metrics|funnel|heatmap|anomalies`, `/health`
 - **Bonus endpoints**: `/ws` (real-time fan-out for the dashboard) and `/stores/{id}/staff-stats` (a *diagnostic* endpoint surfacing the customer-vs-staff exclusion breakdown — useful for reviewers verifying that the staff heuristic isn't silently over-flagging; not part of the customer-metrics contract)
 
@@ -71,21 +72,21 @@ DeepSORT's appearance embeddings add a second neural net (~150-200 ms/frame). Fo
 - Could consolidate to one file with two tables in production; kept separate during dev for faster iteration
 
 ### 3.5 Wire format: lowercase events on the pipeline, canonical UPPERCASE in the API
-The pipeline emits `entry`, `zone_entered`, `queue_joined`, `queue_completed`, `queue_abandoned`, etc. — matching the sample data shapes in the challenge. `app/schemas.py::_normalize_event_type` maps these to the canonical 9 spec types on ingest:
+The pipeline emits `entry`, `zone_entered`, `queue_joined`, `queue_completed`, `queue_abandoned`, etc. — matching the sample data shapes in the challenge. `app/schemas.py::_normalize_event_type` maps these to the canonical spec types on ingest:
 
-| Pipeline (lowercase) | Canonical (UPPERCASE) |
-|---|---|
-| `entry` | `ENTRY` |
-| `exit` | `EXIT` |
-| `reentry` | `REENTRY` |
-| `zone_entered` | `ZONE_ENTER` |
-| `zone_exited` | `ZONE_EXIT` |
-| `zone_dwell` | `ZONE_DWELL` |
-| `queue_joined` | `BILLING_QUEUE_JOIN` |
-| `queue_completed` | `BILLING_QUEUE_COMPLETE` |
-| `queue_abandoned` | `BILLING_QUEUE_ABANDON` |
+| Pipeline (lowercase) | Canonical (UPPERCASE) | In spec catalogue? |
+|---|---|---|
+| `entry` | `ENTRY` | ✅ |
+| `exit` | `EXIT` | ✅ |
+| `reentry` | `REENTRY` | ✅ |
+| `zone_entered` | `ZONE_ENTER` | ✅ |
+| `zone_exited` | `ZONE_EXIT` | ✅ |
+| `zone_dwell` | `ZONE_DWELL` | ✅ |
+| `queue_joined` | `BILLING_QUEUE_JOIN` | ✅ |
+| `queue_abandoned` | `BILLING_QUEUE_ABANDON` | ✅ |
+| `queue_completed` | `BILLING_QUEUE_COMPLETE` | ➕ added (not in spec catalogue) |
 
-`BILLING_QUEUE_COMPLETE` is kept distinct from `BILLING_QUEUE_JOIN` so the funnel can correctly separate "joined the queue" from "actually paid". The system accepts **both** the sample format and the canonical format transparently.
+**Why `BILLING_QUEUE_COMPLETE` is kept distinct**: The spec catalogue lists 8 event types and does *not* include a queue-completion event. We added it because the funnel `Entry → Zone → Billing Queue → Purchase` requires distinguishing "joined the queue" from "actually paid" — without `BILLING_QUEUE_COMPLETE`, every queue join would look identical to a queue abandon, and the conversion-rate column of the funnel would be uncomputable from events alone (we'd be entirely dependent on POS correlation, which has a ±5-min window and silently misses queue-only conversions). The system accepts both the lowercase sample format and the canonical UPPERCASE format transparently.
 
 ### 3.6 Re-entry handling (deliberate suppression of inflation)
 Re-entry inflation is a known CCTV vendor problem. The tracker:
@@ -167,20 +168,25 @@ The constants are module-level on purpose — for a real 8-hour-shift deployment
 
 ## 6. AI-Assisted Decisions
 
+This section documents three places where an LLM materially shaped the design — and explicitly states whether I agreed with the AI suggestion or overrode it after evaluation. Per the spec, the focus is on intentional use, not volume.
+
 ### Decision 1 — Event schema: flat vs polymorphic vs hybrid
 - **AI suggested**: ChatGPT proposed polymorphic Pydantic models per event type for "type safety". Claude proposed a hybrid with a `metadata` object.
+- **Verdict: Partially overrode** — kept Claude's hybrid shape but rejected ChatGPT's per-type polymorphism.
 - **What I did**: Hybrid + `extra: "allow"`. The challenge sample data has 3 different event shapes (entry, zone, queue), each with their own native fields. A single flexible model accepts all three, normalizes lowercase types to canonical UPPERCASE on ingest, and stores the full original payload as JSON for replay/debug.
-- **Why**: Wire-format flexibility was more important than compile-time type strictness. The cost is per-event runtime validation; the benefit is the API accepts both sample-format and spec-format transparently.
+- **Why**: Wire-format flexibility was more important than compile-time type strictness. Per-type polymorphism would have required the producer (the pipeline) to know which model to instantiate, which is fragile when the pipeline output is JSONL written by a separate process. The cost is per-event runtime validation; the benefit is the API accepts both sample-format and spec-format transparently.
 
 ### Decision 2 — Staff detection: uniform vs face vs heuristic
 - **AI suggested**: Claude initially proposed uniform color matching on the torso region.
-- **What I did**: Rejected uniform/face approaches (see §5) and used behavioural heuristic. Tightened thresholds during validation when initial settings produced 40 % false positives, then re-loosened from "production-grade 5/5min" to "clip-tuned 3/40s" once the production rule produced zero detections on 20-min clips.
-- **Why**: Generalisation to evaluation footage matters more than peak accuracy on our own clips, but the thresholds must be sized to the observation window. Module-level constants make production scaling a config change, not a code change.
+- **Verdict: Overrode the suggestion entirely.**
+- **What I did**: Rejected uniform/face approaches (see §5) and used the behavioural heuristic. Tightened thresholds during validation when initial settings produced 40 % false positives, then re-loosened from "production-grade 5/5min" to "clip-tuned 3/40s" once the production rule produced zero detections on 20-min clips.
+- **Why**: Generalisation to evaluation footage matters more than peak accuracy on our own clips, but the thresholds must be sized to the observation window. Module-level constants make production scaling a config change, not a code change. Uniform colour matching would have been brittle on the reviewer's footage (different store, different uniform, possibly different camera white-balance).
 
 ### Decision 3 — Zone classification: VLM vs coordinate-based
-- **AI suggested**: GPT-4V proposed using a vision-language model to identify zones from frames at runtime.
+- **AI suggested**: GPT-4V proposed using a vision-language model to identify zones from frames at runtime ("ask Claude Vision: which department is this person standing in?").
+- **Verdict: Overrode for runtime, kept for offline authoring.**
 - **What I did**: Rejected for primary detection. `store_layout.json` already has explicit zone polygons → coordinate-based check is faster, deterministic, and doesn't need an extra model in the container.
-- **Where VLM still helps**: Initial layout authoring — using GPT-4V on a still frame to *generate the layout JSON*. That's a one-time offline step, not a runtime cost.
+- **Where the VLM still helps**: Initial layout authoring — using GPT-4V on a still frame to *generate the layout JSON*. That's a one-time offline step, not a runtime cost. Documenting this distinction was itself an LLM-shaped decision: when ChatGPT was asked "should we use a VLM here?", the useful answer turned out to be "yes, but at design time, not request time".
 
 ---
 
@@ -214,3 +220,4 @@ The constants are module-level on purpose — for a real 8-hour-shift deployment
 3. **Heuristic staff detection** — needs an observation window; not infallible (see §5 trade-offs). Thresholds are clip-tuned; production deployments should re-scale per §5.5.
 4. **Frame-skip aliasing** — `process_every_n=6` means ~0.2 s blind spots; fast events (a customer crossing a zone in 0.1 s) may be missed
 5. **POS correlation is timestamp-based, not visitor-based** — no face/payment-card linkage between visitor and transaction; we infer purchase by `queue_completed` co-occurring with a POS row near the same time
+6. **Single API replica** — in-process WebSocket fan-out doesn't survive horizontal scale-out; would swap in Redis pub/sub at the first `replicas: 2` config change (see CHOICES.md §3)
