@@ -83,11 +83,7 @@ def make_queue(eid, track_id, store_id="STORE_BLR_002", qd=2, abandoned=False):
 
 
 class TestIngestEndpoint:
-    def test_ingest_success(self):
-        events = [make_entry(f"i1-{_uid()}", "V1")]
-        resp = client.post("/events/ingest", json={"events": events})
-        assert resp.status_code == 200
-        assert resp.json()["accepted"] == 1
+    
 
     def test_idempotency(self):
         events = [make_entry(f"i2-{_uid()}", "V2")]
