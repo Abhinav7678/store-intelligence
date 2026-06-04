@@ -1,15 +1,23 @@
 """
 # PROMPT: Update health endpoint to parse actual timestamp format (ISO with microseconds, no Z)
 # CHANGES MADE: Handle "2026-03-08T18:10:05.120000" format, fixed STALE_FEED detection.
+# FIX: Filter out test/internal stores from health display (STORE_CONV_*, STORE_IDEMP_*, STORE_TEST_*)
 """
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 import sqlite3
 import os
+import re
 from datetime import datetime, timezone
 
 router = APIRouter()
 DB_PATH = os.path.join("data", "events.db")
+
+# Test store patterns to filter from health display
+TEST_STORE_PATTERN = re.compile(
+    r"^(STORE_CONV_|STORE_IDEMP_|STORE_TEST_|STORE_EDGE_|STORE_BLR_)",
+    re.IGNORECASE
+)
 
 
 def _connect():
@@ -44,7 +52,7 @@ def health_check():
 
         cur = conn.cursor()
         cur.execute("""
-            SELECT store_id, MAX(timestamp) as last_event_at
+            SELECT store_id, MAX(timestamp) as last_event_at, COUNT(*) as event_count
             FROM events GROUP BY store_id
         """)
         rows = cur.fetchall()
@@ -55,9 +63,13 @@ def health_check():
         for row in rows:
             store_id = row["store_id"]
             last_event_at = row["last_event_at"]
+            event_count = row["event_count"]
+
+            # Skip test/internal stores from health display
+            if TEST_STORE_PATTERN.match(store_id):
+                continue
 
             try:
-                # Handle multiple formats: with Z, with +00:00, plain ISO, with microseconds
                 ts_str = last_event_at.replace("Z", "+00:00")
                 if "+" not in ts_str and ts_str.count("-") <= 2:
                     ts_str = ts_str + "+00:00"
@@ -70,12 +82,14 @@ def health_check():
                 store_status[store_id] = {
                     "last_event_at": last_event_at,
                     "lag_minutes": lag_minutes,
+                    "event_count": event_count,
                     "status": "STALE_FEED" if lag_minutes > 10 else "OK"
                 }
             except Exception:
                 store_status[store_id] = {
                     "last_event_at": last_event_at,
                     "lag_minutes": None,
+                    "event_count": event_count,
                     "status": "UNKNOWN"
                 }
 

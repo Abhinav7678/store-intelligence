@@ -3,6 +3,7 @@
 # in the actual challenge data format (lowercase event_type, id_token, store_code, etc.)
 # CHANGES MADE: Fixed queue_joined/queue_completed separation, added REENTRY event type,
 # staff flagging on all events, ZONE_DWELL emission, deduped queue events.
+# Added debounce for exit/reentry flickering and duplicate queue cycles.
 """
 
 import json
@@ -111,6 +112,14 @@ class PersonTracker:
         self.reentry_window_frames = 450
         self.staff_zone_threshold = 3
 
+        # ── Debounce state ──
+        self._last_exit_frame = {}          # visitor_id  → frame of last exit
+        self._last_queue_complete_frame = {} # track_id   → frame of last queue_completed
+        self.reentry_cooldown_frames = 450  # 30s at 15fps — suppress flickering reentries
+        self.queue_cooldown_frames = 150    # 10s at 15fps — suppress duplicate queue cycles
+        self._last_zone_change_frame = {}   # track_id   → frame of last zone transition
+        self.zone_change_cooldown = 8       # ~0.5s at 15fps — suppress zone flicker
+
     def _is_likely_staff(self, track):
         zones_visited = set()
         timestamps = []
@@ -130,7 +139,7 @@ class PersonTracker:
 
         return False
 
-    def _check_reentry(self, bbox):
+    def _check_reentry(self, bbox, current_frame):
         x1, y1, x2, y2 = bbox
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
@@ -138,6 +147,13 @@ class PersonTracker:
         for track_id, track in self.exited_tracks.items():
             if track.get("last_bbox") is None:
                 continue
+
+            # DEBOUNCE: skip if this visitor exited too recently (flickering)
+            visitor_id = track["visitor_id"]
+            last_exit = self._last_exit_frame.get(visitor_id, 0)
+            if current_frame - last_exit < self.reentry_cooldown_frames:
+                continue
+
             lx1, ly1, lx2, ly2 = track["last_bbox"]
             lcx = (lx1 + lx2) / 2
             lcy = (ly1 + ly2) / 2
@@ -153,6 +169,9 @@ class PersonTracker:
         for det in detections:
             try:
                 bbox, conf = det
+                # Drop very low confidence detections
+                if conf < 0.35:
+                    continue
                 x1, y1, x2, y2 = bbox
                 cx = (x1 + x2) / 2
                 cy = (y1 + y2) / 2
@@ -176,7 +195,8 @@ class PersonTracker:
                 track_id = closest_track_id
                 matched_tracks.add(track_id)
             else:
-                reentry_id, reentry_track = self._check_reentry(bbox)
+                # Pass current_frame for debounce check
+                reentry_id, reentry_track = self._check_reentry(bbox, frame_idx)
 
                 if reentry_track is not None:
                     track_id = self.next_track_id
@@ -191,13 +211,12 @@ class PersonTracker:
                         "frames_unseen": 0,
                         "session_seq": reentry_track.get("session_seq", 0),
                         "is_staff": False,
-                        "in_billing": False,       # FIX: track billing state
-                        "billing_join_ts": None,    # FIX: track queue join time
+                        "in_billing": False,
+                        "billing_join_ts": None,
                     }
                     del self.exited_tracks[reentry_id]
                     matched_tracks.add(track_id)
 
-                    # FIX: Emit REENTRY event type instead of regular entry
                     events.append(self._make_entry_event(
                         visitor_id=reentry_track["visitor_id"],
                         timestamp=timestamp,
@@ -219,8 +238,8 @@ class PersonTracker:
                         "frames_unseen": 0,
                         "session_seq": 1,
                         "is_staff": False,
-                        "in_billing": False,       # FIX: track billing state
-                        "billing_join_ts": None,    # FIX: track queue join time
+                        "in_billing": False,
+                        "billing_join_ts": None,
                     }
                     matched_tracks.add(track_id)
 
@@ -241,6 +260,15 @@ class PersonTracker:
             current_zone = zone_classifier.classify(bbox)
             if current_zone and current_zone != "ENTRY":
                 if track["last_zone"] != current_zone:
+                    # DEBOUNCE: suppress rapid zone flicker
+                    last_change = self._last_zone_change_frame.get(track_id, -self.zone_change_cooldown)
+                    if frame_idx - last_change < self.zone_change_cooldown:
+                        # Too soon — skip this zone transition
+                        track["history"].append({"zone": current_zone, "frame": frame_idx})
+                        continue
+
+                    self._last_zone_change_frame[track_id] = frame_idx
+
                     # Zone exit from previous zone
                     if track["last_zone"] and track["last_zone"] != "ENTRY":
                         events.append(self._make_zone_event(
@@ -254,12 +282,14 @@ class PersonTracker:
                             is_staff=track["is_staff"],
                         ))
 
-                        # FIX: If leaving BILLING zone, emit queue_completed
+                        # If leaving BILLING zone, emit queue_completed
                         if track["last_zone"] == "BILLING" and track.get("in_billing"):
                             billing_count = sum(
                                 1 for t in self.active_tracks.values()
                                 if t.get("in_billing")
                             )
+                            # Track completion frame for debounce
+                            self._last_queue_complete_frame[track_id] = frame_idx
                             events.append(self._make_queue_event(
                                 event_type="queue_completed",
                                 track_id=track_id,
@@ -287,26 +317,28 @@ class PersonTracker:
                     ))
                     track["last_dwell_frame"][current_zone] = frame_idx
 
-                    # FIX: If entering BILLING, emit queue_joined (not completed)
+                    # If entering BILLING, emit queue_joined (with debounce)
                     if current_zone == "BILLING" and not track.get("in_billing"):
-                        billing_count = sum(
-                            1 for t in self.active_tracks.values()
-                            if t.get("in_billing")
-                        )
-                        track["in_billing"] = True
-                        track["billing_join_ts"] = timestamp
-                        events.append(self._make_queue_event(
-                            event_type="queue_joined",
-                            track_id=track_id,
-                            zone_id=current_zone,
-                            timestamp=timestamp,
-                            queue_position=billing_count + 1,
-                            confidence=float(conf),
-                            bbox=bbox,
-                            is_staff=track["is_staff"],
-                        ))
+                        last_q = self._last_queue_complete_frame.get(track_id, 0)
+                        if frame_idx - last_q > self.queue_cooldown_frames:
+                            billing_count = sum(
+                                1 for t in self.active_tracks.values()
+                                if t.get("in_billing")
+                            )
+                            track["in_billing"] = True
+                            track["billing_join_ts"] = timestamp
+                            events.append(self._make_queue_event(
+                                event_type="queue_joined",
+                                track_id=track_id,
+                                zone_id=current_zone,
+                                timestamp=timestamp,
+                                queue_position=billing_count + 1,
+                                confidence=float(conf),
+                                bbox=bbox,
+                                is_staff=track["is_staff"],
+                            ))
 
-                # FIX: ZONE_DWELL — emit every 30s of continuous dwell
+                # ZONE_DWELL — emit every 30s of continuous dwell
                 if current_zone in track.get("last_dwell_frame", {}):
                     frames_in_zone = frame_idx - track["last_dwell_frame"][current_zone]
                     if frames_in_zone >= self.dwell_interval_frames:
@@ -337,7 +369,7 @@ class PersonTracker:
                     track = self.active_tracks[track_id]
                     is_staff = self._is_likely_staff(track)
 
-                    # FIX: If still in billing when exiting, emit queue_abandoned
+                    # If still in billing when exiting, emit queue_abandoned
                     if track.get("in_billing"):
                         events.append(self._make_queue_event(
                             event_type="queue_abandoned",
@@ -350,6 +382,9 @@ class PersonTracker:
                             join_ts=track.get("billing_join_ts", timestamp),
                             is_staff=is_staff,
                         ))
+
+                    # Track exit frame for reentry debounce
+                    self._last_exit_frame[track["visitor_id"]] = frame_idx
 
                     events.append(self._make_exit_event(
                         visitor_id=track["visitor_id"],
@@ -376,7 +411,6 @@ class PersonTracker:
 
     def _make_entry_event(self, visitor_id, timestamp, confidence=0.9, is_staff=False, is_reentry=False):
         return {
-            # FIX: Use "reentry" event type when re-entering
             "event_type": "reentry" if is_reentry else "entry",
             "id_token": visitor_id,
             "store_code": self.store_id,
@@ -438,7 +472,6 @@ class PersonTracker:
         cx = (bbox[0] + bbox[2]) / 2 if bbox else 0
         cy = (bbox[1] + bbox[3]) / 2 if bbox else 0
 
-        # Calculate wait_seconds
         wait_seconds = 0
         if join_ts and event_type in ("queue_completed", "queue_abandoned"):
             try:
@@ -565,7 +598,6 @@ def process_clip(video_path, camera_id, store_id, layout_path, clip_start_time=N
     for track_id, track in list(tracker.active_tracks.items()):
         is_staff = tracker._is_likely_staff(track)
 
-        # FIX: If still in billing, emit queue_abandoned
         if track.get("in_billing"):
             all_events.append(tracker._make_queue_event(
                 event_type="queue_abandoned",

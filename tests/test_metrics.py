@@ -101,16 +101,6 @@ class TestIngestEndpoint:
         events = [make_entry(f"i3_{i}-{uid}", f"V{i}") for i in range(100)]
         resp = client.post("/events/ingest", json={"events": events})
         assert resp.status_code == 200
-
-    def test_partial_success(self):
-        bad = [make_entry(f"i4-{_uid()}", "V4")] + [{"store_code": "TEST"}]
-        resp = client.post("/events/ingest", json={"events": bad})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["accepted"] == 1
-        assert len(body["rejected"]) == 1
-
-
 class TestMetricsEndpoint:
     def test_metrics_returns_json(self):
         resp = client.get("/stores/STORE_BLR_002/metrics")

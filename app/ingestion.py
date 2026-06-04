@@ -2,11 +2,14 @@
 # PROMPT: Rewrite event ingestion to accept actual challenge data format with 3 event shapes
 # CHANGES MADE: Extract store_id from store_code/store_id, visitor_id from id_token/track_id,
 # timestamp from event_timestamp/event_time/queue_join_ts. Use model_validate (Pydantic v2).
+# Added server-side debounce to suppress duplicate visitor+event_type within 5s window.
 """
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from typing import List, Dict, Any
+from datetime import datetime
+from collections import defaultdict
 import sqlite3
 import os
 import json
@@ -24,6 +27,39 @@ logger = logging.getLogger("store_intelligence.ingestion")
 os.makedirs("data", exist_ok=True)
 DB_PATH = os.path.join("data", "events.db")
 _db_lock = threading.Lock()
+
+# ── Server-side event deduplication ──
+_recent_events: Dict[str, str] = {}   # "visitor:event_type" → last timestamp
+DEDUP_WINDOW_SECONDS = 5              # suppress same visitor+event_type within 5s
+
+
+def _is_duplicate_event(evt: "Event") -> bool:
+    """Suppress same visitor + event_type if timestamps are within DEDUP_WINDOW_SECONDS."""
+    visitor = evt.get_visitor_id()
+    etype = evt.event_type
+    ts = evt.get_timestamp()
+    if not visitor or not ts:
+        return False
+
+    key = f"{visitor}:{etype}"
+    prev_ts = _recent_events.get(key)
+
+    if prev_ts:
+        try:
+            prev = datetime.fromisoformat(prev_ts.replace("Z", "+00:00"))
+            curr = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if abs((curr - prev).total_seconds()) < DEDUP_WINDOW_SECONDS:
+                return True
+        except Exception:
+            pass
+
+    _recent_events[key] = ts
+
+    # Prevent memory leak: trim old entries every 1000 keys
+    if len(_recent_events) > 5000:
+        _recent_events.clear()
+
+    return False
 
 
 def _init_db(conn: sqlite3.Connection):
@@ -95,6 +131,11 @@ async def ingest_events(request: Request):
     with _db_lock:
         cur = conn.cursor()
         for evt in valid_events:
+            # Server-side debounce: suppress same visitor+event_type within 5s
+            if _is_duplicate_event(evt):
+                ignored_duplicates += 1
+                continue
+
             event_id = evt.get_event_id()
             store_id = evt.get_store_id()
             visitor_id = evt.get_visitor_id()

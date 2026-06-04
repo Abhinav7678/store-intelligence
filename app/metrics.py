@@ -3,6 +3,7 @@
 # zone_entered/zone_exited with track_id, queue_completed/queue_abandoned, POS with DD-MM-YYYY dates
 # CHANGES MADE: Queue depth from queue_joined - queue_completed/abandoned. Reentry counted as entry.
 # Staff excluded. POS correlation with actual CSV format.
+# FIX: Use zone_id as stable key for dwell pairing. Added /staff-stats endpoint.
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -23,6 +24,51 @@ def _connect():
         return conn
     except Exception:
         raise HTTPException(status_code=503, detail="db_unavailable")
+
+
+@router.get("/stores/{store_id}/staff-stats")
+def staff_stats(store_id: str):
+    """Return staff vs customer detection counts for the store."""
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+
+        staff_row = cur.execute(
+            "SELECT COUNT(DISTINCT visitor_id) as cnt FROM events WHERE store_id = ? AND is_staff = 1",
+            (store_id,)
+        ).fetchone()
+        staff_count = staff_row["cnt"] if staff_row else 0
+
+        cust_row = cur.execute(
+            "SELECT COUNT(DISTINCT visitor_id) as cnt FROM events WHERE store_id = ? AND is_staff = 0",
+            (store_id,)
+        ).fetchone()
+        customer_count = cust_row["cnt"] if cust_row else 0
+
+        staff_events_row = cur.execute(
+            "SELECT COUNT(*) as cnt FROM events WHERE store_id = ? AND is_staff = 1",
+            (store_id,)
+        ).fetchone()
+        staff_events = staff_events_row["cnt"] if staff_events_row else 0
+
+        conn.close()
+        return JSONResponse(content={
+            "store_id": store_id,
+            "staff_count": staff_count,
+            "customer_count": customer_count,
+            "total_people": staff_count + customer_count,
+            "staff_events": staff_events,
+            "exclusion_pct": round((staff_count / (staff_count + customer_count)) * 100, 2)
+                if (staff_count + customer_count) > 0 else 0.0,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail=f"error: {str(e)}")
 
 
 @router.get("/stores/{store_id}/metrics")
@@ -65,6 +111,7 @@ def store_metrics(store_id: str):
         zone_enter_times = {}
         zone_dwell_total = {}
         zone_dwell_count = {}
+        zone_display_names = {}
         queue_joined = set()
         queue_exited = set()
         abandonments = 0
@@ -83,31 +130,36 @@ def store_metrics(store_id: str):
                 if visitor_id:
                     visitors.add(visitor_id)
 
-            # Zone dwell
+            # Zone dwell — use zone_id as STABLE key for pairing
             if event_type in ("zone_entered", "ZONE_ENTER"):
-                zone = row["zone_name"] or row["zone_id"] or ""
+                zone_key = row["zone_id"] or row["zone_name"] or ""
+                display_name = row["zone_name"] or row["zone_id"] or zone_key
                 ts = row["timestamp"]
-                if visitor_id and zone:
-                    zone_enter_times[(visitor_id, zone)] = ts
+                if visitor_id and zone_key:
+                    zone_enter_times[(visitor_id, zone_key)] = ts
+                    zone_display_names[zone_key] = display_name
 
             if event_type in ("zone_exited", "ZONE_EXIT"):
-                zone = row["zone_name"] or row["zone_id"] or ""
+                zone_key = row["zone_id"] or row["zone_name"] or ""
+                display_name = row["zone_name"] or row["zone_id"] or zone_key
                 ts = row["timestamp"]
-                key = (visitor_id, zone)
+                key = (visitor_id, zone_key)
                 if key in zone_enter_times and ts:
                     try:
                         enter_dt = datetime.fromisoformat(zone_enter_times[key])
                         exit_dt = datetime.fromisoformat(ts)
                         dwell_ms = int((exit_dt - enter_dt).total_seconds() * 1000)
                         if dwell_ms > 0:
-                            zone_dwell_total[zone] = zone_dwell_total.get(zone, 0) + dwell_ms
-                            zone_dwell_count[zone] = zone_dwell_count.get(zone, 0) + 1
+                            zone_dwell_total[zone_key] = zone_dwell_total.get(zone_key, 0) + dwell_ms
+                            zone_dwell_count[zone_key] = zone_dwell_count.get(zone_key, 0) + 1
+                            zone_display_names[zone_key] = display_name
                     except Exception:
                         pass
                     del zone_enter_times[key]
 
-            # Queue events — track who joined and who left
-            if event_type in ("queue_joined", "queue_completed", "queue_abandoned", "BILLING_QUEUE_JOIN"):
+            # Queue events
+            if event_type in ("queue_joined", "queue_completed", "queue_abandoned",
+                              "BILLING_QUEUE_JOIN"):
                 if visitor_id:
                     queue_joined.add(visitor_id)
 
@@ -167,12 +219,15 @@ def store_metrics(store_id: str):
         converted = len(converted_visitors)
         conversion_rate = round((converted / unique_visitors) * 100, 2) if unique_visitors else 0.0
 
-        avg_dwell_per_zone = {
-            zone: round(zone_dwell_total[zone] / zone_dwell_count[zone])
-            for zone in zone_dwell_total if zone_dwell_count.get(zone, 0) > 0
-        }
+        # Build avg dwell with display names
+        avg_dwell_per_zone = {}
+        for zone_key in zone_dwell_total:
+            if zone_dwell_count.get(zone_key, 0) > 0:
+                display = zone_display_names.get(zone_key, zone_key)
+                avg_dwell_per_zone[display] = round(
+                    zone_dwell_total[zone_key] / zone_dwell_count[zone_key]
+                )
 
-        # Queue depth = people currently in queue (joined but not yet exited)
         queue_depth = max(0, len(queue_joined) - len(queue_exited))
         total_queue = len(queue_joined)
         abandonment_rate = round((abandonments / total_queue) * 100, 2) if total_queue else 0.0
