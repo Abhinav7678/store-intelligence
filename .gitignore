@@ -1,10 +1,11 @@
-# Dataset - DO NOT UPLOAD
-data/cctv/
-data/events/
+# Videos - DO NOT UPLOAD
+data/CCTV Footage/
 *.mp4
 *.avi
 *.mkv
-*.csv
+
+# Processed output
+data/processed/
 
 # Database
 *.db
@@ -15,6 +16,7 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 venv/
+.venv/
 .env
 
 # IDE
@@ -24,14 +26,3 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
-.venv/
-yolov8n.pt
-.coverage
-__pycache__/
-data/*.db
-
-data/processed/
-data/CCTV Footage/
-data/*.db
-data/*.jsonl
-data/*.csv
