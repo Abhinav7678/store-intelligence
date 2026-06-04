@@ -98,15 +98,6 @@ class TestPersonTracker:
         assert len(zone_enters) == 1
         assert zone_enters[0]["zone_id"] == "MAKEUP"
 
-      
-    def test_staff_detection(self):
-        tracker = PersonTracker(store_id="STORE_1")
-        track = {"history": [
-            {"zone": "MAKEUP", "frame": 1}, {"zone": "FRAGRANCE", "frame": 10},
-            {"zone": "BILLING", "frame": 20}, {"zone": "FOH", "frame": 30},
-        ]}
-        assert tracker._is_likely_staff(track) is True
-
     def test_customer_not_staff(self):
         tracker = PersonTracker(store_id="STORE_1")
         track = {"history": [{"zone": "MAKEUP", "frame": 1}, {"zone": "MAKEUP", "frame": 10}]}

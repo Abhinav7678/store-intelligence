@@ -110,7 +110,10 @@ class PersonTracker:
         self.exit_timeout_frames = 90
         self.dwell_interval_frames = 450  # ~30s at 15fps
         self.reentry_window_frames = 450
-        self.staff_zone_threshold = 3
+        # In __init__, change:
+        self.staff_zone_threshold = 3       # cover ≥3 of ~7 zones (was 3 — keep)
+        self.staff_min_frames = 20          # was 50 — short-clip friendly
+        self.staff_min_span_frames = 600    # was 1800 — 20s @ 30fps source frames
 
         # ── Debounce state ──
         self._last_exit_frame = {}          # visitor_id  → frame of last exit
@@ -129,15 +132,14 @@ class PersonTracker:
             if h.get("frame") is not None:
                 timestamps.append(h["frame"])
 
-        if len(zones_visited) >= self.staff_zone_threshold:
-            return True
+        many_zones = len(zones_visited) >= self.staff_zone_threshold
+        long_persistence = (
+            len(timestamps) >= self.staff_min_frames
+            and (max(timestamps) - min(timestamps)) >= self.staff_min_span_frames
+    )
 
-        if timestamps and len(timestamps) > 50:
-            span = max(timestamps) - min(timestamps)
-            if span > 1800:
-                return True
-
-        return False
+             # Both signals required (was OR — biggest fix)
+        return many_zones and long_persistence
 
     def _check_reentry(self, bbox, current_frame):
         x1, y1, x2, y2 = bbox
@@ -560,7 +562,7 @@ def process_clip(video_path, camera_id, store_id, layout_path, clip_start_time=N
 
     frame_idx = 0
     all_events = []
-    process_every_n = 2
+    process_every_n = 5
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -573,7 +575,7 @@ def process_clip(video_path, camera_id, store_id, layout_path, clip_start_time=N
 
         timestamp = (clip_start_time + timedelta(seconds=frame_idx / fps)).isoformat()
         try:
-            results = model(frame, classes=[0], conf=0.50, verbose=False)
+            results = model(frame, classes=[0], conf=0.35, imgsz=640, verbose=False)
             detections = []
             for r in results:
                 for box in r.boxes:

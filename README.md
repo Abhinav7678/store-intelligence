@@ -1,259 +1,248 @@
 # Store Intelligence — AI-Powered Retail Analytics
 
-## 🚀 Quick Start
+End-to-end system that turns raw retail CCTV into live operational intelligence: visitor counting, conversion funnels, zone heatmaps, queue analytics, and anomaly alerts — all served through a containerized REST API + WebSocket dashboard.
+
+---
+
+## 🚀 Quick Start (60 seconds)
 
 ```bash
 git clone https://github.com/Abhinav7678/store-intelligence.git
 cd store-intelligence
-docker compose up --build
+docker compose up --build -d
 ```
 
-- **API Docs:** http://localhost:8000/docs
-- **Live Dashboard:** http://localhost:8000/ (real-time metrics via WebSocket)
+Then open:
+- **Live Dashboard:** http://localhost:8000/
+- **API Docs (Swagger):** http://localhost:8000/docs
+- **Health:** http://localhost:8000/health
 
-## 📋 Overview
+To populate the dashboard with data, see [Running the Detection Pipeline](#-running-the-detection-pipeline) below.
 
-An end-to-end AI-powered Store Intelligence System that processes raw CCTV footage from retail stores, detects and tracks customer behaviour, and exposes real-time analytics through production-ready REST APIs.
+---
 
-**Key Capabilities:**
-- Person detection & tracking from CCTV footage
-- 8 event types: ENTRY, EXIT, ZONE_ENTER, ZONE_EXIT, ZONE_DWELL, BILLING_QUEUE_JOIN, BILLING_QUEUE_ABANDON, REENTRY
-- Real-time metrics, funnel analysis, heatmaps, and anomaly detection
-- Staff exclusion from visitor metrics
-- Idempotent event ingestion with deduplication
-- Graceful degradation (503 responses, never crashes)
-- Live Web Dashboard with real-time WebSocket updates
+## 📋 What This Does
+
+| Stage | Component | Output |
+|---|---|---|
+| 1 | YOLOv8 + tracker on CCTV clips | JSONL of behavioural events |
+| 2 | POST events to FastAPI | SQLite event store + WebSocket fan-out |
+| 3 | Aggregation endpoints | Live metrics, funnel, heatmap, anomalies |
+| 4 | HTML dashboard | Real-time KPI tiles + funnel chart |
+
+**Event types (8 canonical):** `ENTRY`, `EXIT`, `REENTRY`, `ZONE_ENTER`, `ZONE_EXIT`, `ZONE_DWELL`, `BILLING_QUEUE_JOIN`, `BILLING_QUEUE_ABANDON`
+
+The pipeline emits the sample-data lowercase form (`entry`, `zone_entered`, `queue_joined`) and the API normalizes to canonical UPPERCASE on ingest — see [DESIGN.md §3.5](docs/DESIGN.md#35-wire-format-lowercase-events-on-the-pipeline-canonical-uppercase-in-the-api).
+
+---
 
 ## 🏗️ Architecture
 
 ```
-CCTV Footage (5 stores × 3 cameras)
+CCTV clips (multi-store, multi-camera)
     │
     ▼
-┌─────────────────────────┐
-│  Detection Pipeline      │
-│  YOLOv8n → Tracker →    │
-│  Event Emitter           │
-└───────────┬─────────────┘
-            │ JSONL events
-            ▼
-┌─────────────────────────┐
-│  POST /events/ingest     │
-│  (batch, idempotent)     │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│  SQLite Database         │
-└───────────┬─────────────┘
-            │
-    ┌───────┴────────┐
-    ▼                ▼
-┌──────────┐  ┌──────────────┐
-│ REST API │  │ WebSocket    │
-│ Endpoints│  │ Live Dashboard│
-└──────────┘  └──────────────┘
+┌─────────────────────────────┐
+│  Detection Pipeline (host)   │
+│  YOLOv8n → tracker → emitter │
+│  produces JSONL per camera   │
+└────────────┬────────────────┘
+             │ POST /events/ingest
+             ▼
+┌─────────────────────────────┐
+│  FastAPI (Docker container)  │
+│  • events.db   (SQLite)      │
+│  • store_intelligence.db (POS) │
+└─────┬──────────────┬─────────┘
+      │              │
+      ▼              ▼
+┌──────────┐   ┌────────────────┐
+│ REST API │   │ WebSocket /ws  │
+│ /metrics │   │ live broadcast │
+│ /funnel  │   └─────┬──────────┘
+│ /heatmap │         │
+│ /anomalies│        ▼
+│ /health  │   ┌────────────────┐
+└──────────┘   │ HTML Dashboard │
+               │ (port 8000)    │
+               └────────────────┘
 ```
+
+See [DESIGN.md](docs/DESIGN.md) for full data flow and design decisions.
+
+---
+
+## 🔌 API Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/events/ingest` | POST | Batch up to 500 events, idempotent on `event_id` |
+| `/stores/{store_id}/metrics` | GET | Unique visitors, conversion rate, avg dwell, queue depth |
+| `/stores/{store_id}/funnel` | GET | ENTRY → ZONE → QUEUE → PURCHASE with drop-off % |
+| `/stores/{store_id}/heatmap` | GET | Per-zone visit count, dwell, score (0-100) |
+| `/stores/{store_id}/anomalies` | GET | Queue spike, dead zone, conversion drop alerts |
+| `/stores/{store_id}/staff-stats` | GET | Customer vs staff exclusion breakdown |
+| `/health` | GET | Per-store `STALE_FEED` detection (>10 min lag) |
+| `/ws` | WS | Real-time event broadcast for the dashboard |
+| `/` | GET | Live dashboard (HTML) |
+| `/docs` | GET | Swagger UI |
+
+---
+
+## 🎥 Running the Detection Pipeline
+
+The detection pipeline runs on the **host** (not in Docker) because it needs OpenCV + YOLO weights, which would bloat the API image.
+
+### 0. Prerequisites
+```bash
+# Python 3.10+ in a venv
+python -m venv nv
+# Windows: nv\Scripts\activate     |  Linux/Mac: source nv/bin/activate
+pip install -r requirements.txt -r requirements-cv.txt
+```
+
+### 1. Drop your CCTV clips into `data/CCTV Footage/<store>/`
+Examples:
+```
+data/CCTV Footage/Store 1/CAM 3 - entry.mp4
+data/CCTV Footage/Store 1/CAM 5 - billing.mp4
+data/CCTV Footage/Store 2/entry 1.mp4
+data/CCTV Footage/Store 2/billing_area.mp4
+data/CCTV Footage/Store 2/zone.mp4
+```
+Camera-to-store mapping is configured in `data/store_layout.json` (committed sample provided).
+
+### 2. Load POS transactions (one-off)
+```bash
+python pipeline/load_pos.py "data/POS - sample transactions.csv"
+```
+
+### 3. Run detection on all stores
+```bash
+# Cross-platform (recommended):
+python pipeline/detect.py --all --layout data/store_layout.json --start_time "2026-03-08T18:00:00Z"
+
+# Or via the orchestrator script (Linux/Mac/WSL):
+bash pipeline/run.sh
+```
+
+### 4. Emit events to the API
+```bash
+# Linux / Mac
+for f in data/processed/*_events.jsonl; do
+  python pipeline/emit.py --input "$f" --api_url http://localhost:8000
+done
+
+# Windows (PowerShell)
+Get-ChildItem data/processed/*_events.jsonl | ForEach-Object {
+    python pipeline/emit.py --input $_.FullName --api_url http://localhost:8000
+}
+```
+
+### 5. Open the dashboard
+http://localhost:8000/ — KPIs and funnel update live as events flow.
+
+---
 
 ## 📁 Project Structure
 
 ```
 store-intelligence/
 ├── app/
-│   ├── __init__.py        # App package init
-│   ├── main.py            # FastAPI entrypoint
-│   ├── models.py          # Database models
-│   ├── schemas.py         # Pydantic request/response schemas
-│   ├── ingestion.py       # Ingest + dedup logic
-│   ├── metrics.py         # Real-time metric computation
-│   ├── funnel.py          # Funnel + session logic
-│   ├── heatmap.py         # Zone heatmap generation
-│   ├── anomalies.py       # Anomaly detection
-│   ├── health.py          # Health + stale feed detection
-│   ├── sessions.py        # Session management
-│   └── ws.py              # WebSocket for live dashboard
+│   ├── main.py             # FastAPI entrypoint
+│   ├── schemas.py          # Pydantic models + event-type normalization
+│   ├── ingestion.py        # POST /events/ingest with idempotency
+│   ├── metrics.py          # /metrics + /staff-stats
+│   ├── funnel.py           # /funnel with drop-off
+│   ├── heatmap.py          # /heatmap (count + dwell)
+│   ├── anomalies.py        # /anomalies (queue spike, dead zone, etc.)
+│   ├── health.py           # /health with stale-feed detection
+│   ├── sessions.py         # Session reconstruction + POS correlation
+│   ├── ws.py               # WebSocket broadcast hub
+│   └── models.py           # SQLite schema bootstrap
 ├── pipeline/
-│   ├── __init__.py        # Pipeline package init
-│   ├── detect.py          # YOLOv8 person detection
-│   ├── tracker.py         # Re-ID / tracking logic
-│   ├── emit.py            # Event schema + emission
-│   ├── load_pos.py        # POS transaction loading + correlation
-│   └── run.sh             # One command to process all clips
-├── scripts/
-│   ├── migrate.py         # Database migration script
-│   ├── run_acceptance.sh  # Acceptance test runner (Linux/Mac)
-│   ├── run_acceptance.ps1 # Acceptance test runner (Windows)
-│   ├── run_tests.sh       # Test runner (Linux/Mac)
-│   ├── run_tests.ps1      # Test runner (Windows)
-│   ├── validate_events.py # Event schema validation
-│   └── verify_all.ps1     # Full verification script
-├── tests/
-│   ├── __init__.py
-│   ├── conftest.py              # Shared test fixtures
-│   ├── test_anomalies.py       # Anomaly scenario tests
-│   ├── test_endpoints.py       # API endpoint integration tests
-│   ├── test_ingestion_idempotency.py  # Idempotency verification
-│   ├── test_metrics.py         # Metrics computation tests
-│   ├── test_pipeline.py        # Detection pipeline tests
-│   ├── test_sessions_and_schema.py    # Session + schema tests
-│   └── test_ws_publish.py      # WebSocket publish tests
+│   ├── detect.py           # YOLOv8 + tracker + zone classifier + event emitter
+│   ├── tracker.py          # Re-ID compatible distance tracker (alt impl)
+│   ├── emit.py             # JSONL → API ingest
+│   ├── load_pos.py         # CSV → store_intelligence.db
+│   └── run.sh              # End-to-end orchestrator
+├── dashboard/
+│   └── index.html          # Live HTML dashboard
+├── tests/                  # pytest suite (>80% coverage on app/)
 ├── docs/
-│   ├── DESIGN.md          # Architecture + AI-assisted decisions
-│   └── CHOICES.md         # 3 decisions with full reasoning
-├── data/                  # Runtime data (SQLite DB, store layouts)
-├── index.html             # Live Web Dashboard UI
-├── sample_events_acceptance.json  # Acceptance test events
-├── check_db.py            # Database verification utility
+│   ├── DESIGN.md           # Architecture + edge cases + AI decisions
+│   └── CHOICES.md          # 3 deep-dive technical decisions
+├── data/
+│   ├── store_layout.json   # Zone polygons + camera mappings (sample committed)
+│   ├── events.db           # Event store (gitignored, regenerated)
+│   └── store_intelligence.db  # POS data (gitignored)
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
-├── requirements-cv.txt    # CV/detection pipeline dependencies
-├── .flake8
-├── .gitignore
+├── requirements-cv.txt     # Pipeline-only deps (cv2, ultralytics)
 └── README.md
 ```
 
-## 🔌 API Endpoints
+---
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/events/ingest` | POST | Batch ingest up to 500 events (idempotent) |
-| `/stores/{store_id}/metrics` | GET | Visitors, conversion rate, avg dwell, queue depth |
-| `/stores/{store_id}/funnel` | GET | ENTRY → ZONE → BILLING → PURCHASE with dropoff % |
-| `/stores/{store_id}/heatmap` | GET | Zone scores (0-100) based on visits + dwell |
-| `/stores/{store_id}/anomalies` | GET | Queue spike, dead zone, conversion drop alerts |
-| `/health` | GET | Service health + STALE_FEED detection per store |
-| `/ws` | WebSocket | Real-time event stream for live dashboard |
-
-## 🎥 Running Detection Pipeline
+## 🧪 Tests
 
 ```bash
-# Copy CCTV clips to data/cctv/
-mkdir -p data/cctv
-cp /path/to/clips/*.mp4 data/cctv/
-
-# Process all clips and emit events
-bash pipeline/run.sh
-```
-
-Or process directly:
-```bash
-python -m pipeline.detect
-```
-
-Events are emitted as JSONL and automatically ingested into the API.
-
-## 📊 Live Dashboard (Part E)
-
-After starting the API with `docker compose up --build`, open the live dashboard:
-
-```
-http://localhost:8000/
-```
-
-The dashboard displays real-time metrics via WebSocket:
-- **Unique Visitors** (excluding staff)
-- **Conversion Rate** (visitors → purchase)
-- **Avg Dwell Time** across zones
-- **Queue Depth** at billing
-- **Funnel Analysis** with drop-off percentages
-
-Metrics update live as events flow in from the detection pipeline.
-
-## 🧪 Running Tests
-
-```bash
-# Run all tests with coverage
 pytest tests/ -v --cov=app --cov-report=term-missing
-
-# Run acceptance tests
-bash scripts/run_acceptance.sh
-
-# Validate event schema
-python scripts/validate_events.py
 ```
+Current coverage: **>80%** on `app/`. Tests cover ingest idempotency, metrics math, funnel drop-off, anomaly thresholds, schema validation, and WebSocket fan-out.
 
-## 🐳 Docker
-
-```bash
-# Start
-docker compose up --build
-
-# Stop
-docker compose down
-```
-
-## 📊 Sample API Usage
-
-### Ingest Events
-```bash
-curl -X POST http://localhost:8000/events/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "events": [{
-      "event_id": "evt_001",
-      "store_id": "STORE_BLR_002",
-      "camera_id": "CAM_1",
-      "visitor_id": "VIS_000001",
-      "event_type": "ENTRY",
-      "timestamp": "2026-04-10T14:00:00Z",
-      "zone_id": null,
-      "dwell_ms": 0,
-      "is_staff": false,
-      "confidence": 0.92,
-      "metadata": {"queue_depth": null, "sku_zone": null, "session_seq": 1}
-    }]
-  }'
-```
-
-### Get Metrics
-```bash
-curl http://localhost:8000/stores/STORE_BLR_002/metrics
-```
-
-### Get Funnel
-```bash
-curl http://localhost:8000/stores/STORE_BLR_002/funnel
-```
-
-### Get Anomalies
-```bash
-curl http://localhost:8000/stores/STORE_BLR_002/anomalies
-```
-
-## 🔧 Tech Stack
-
-| Component | Choice | Reasoning |
-|-----------|--------|-----------|
-| Detection | YOLOv8 Nano | Fast CPU inference, sufficient for person detection |
-| Tracking | Custom distance-based | Lighter than DeepSORT, works for fixed cameras |
-| API | FastAPI | Auto-docs, async, type-safe, Python ecosystem |
-| Database | SQLite | Portable, no setup, sufficient for single store |
-| Dashboard | HTML + WebSocket | Real-time updates, no extra framework needed |
-| Container | Docker Compose | Single command startup requirement |
-| Testing | pytest | Industry standard, good coverage reporting |
-
-## 📝 Documentation
-
-- **[DESIGN.md](docs/DESIGN.md)** — Full architecture, data flow, edge cases, and AI-assisted decisions
-- **[CHOICES.md](docs/CHOICES.md)** — 3 key technical decisions with alternatives considered and trade-offs
+---
 
 ## ⚡ Edge Cases Handled
 
-- **Group entry**: Each person tracked individually
-- **Staff exclusion**: Staff filtered from all visitor metrics
-- **Re-entry**: Same visitor gets same ID on return
-- **Partial occlusion**: Low-confidence detections flagged, not dropped
-- **Empty store**: Returns zero metrics, no crashes
-- **Duplicate events**: Idempotent ingestion by event_id
-- **Database failure**: Returns HTTP 503 with structured error
-- **Stale feed**: Health endpoint reports lag > 10 minutes
-- **Camera overlap**: Cross-camera deduplication prevents double-counting
+Documented in detail in [DESIGN.md §4](docs/DESIGN.md#4-edge-case-handling). Summary:
+
+- **Group entry** — per-person tracking, 200-px match radius keeps close-spaced people separate
+- **Staff exclusion** — behavioural heuristic (≥5 zones AND ≥5 min); ~10% staff fraction (was 40% before tightening)
+- **Re-entry** — 30 s spatial-match window emits `REENTRY` reusing visitor_id (suppresses inflation)
+- **Partial occlusion** — `conf=0.35`; low-conf detections kept and flagged via `is_face_hidden`
+- **Queue buildup** — live `queue_depth`, `queue_joined`/`completed`/`abandoned` events with positions
+- **Zone flicker** — 0.5 s cooldown suppresses rapid border oscillation
+- **Empty store** — endpoints return zeros, never crash
+- **Duplicate ingest** — `event_id` PK constraint + `duplicates_ignored` in response
+- **Stale feed** — `/health` flags any store with no events in last 10 min
+- **DB unavailable** — HTTP 503 with structured body, no stack traces
+
+---
 
 ## 🤖 AI Tools Used
 
-- GitHub Copilot — Code generation and boilerplate
-- Claude — Architecture decisions and edge case analysis
-- ChatGPT — Documentation and test scenario generation
+- **GitHub Copilot** — boilerplate, test scaffolding, Pydantic models
+- **Claude (Anthropic)** — architecture decisions, edge-case analysis, staff-detection trade-offs
+- **ChatGPT** — documentation drafting, test scenario brainstorming
 
-All AI-assisted decisions are documented with prompts and changes made (see prompt block headers in test files and `docs/DESIGN.md`).
+Every test file has a `# PROMPT:` header recording the prompt and what was kept/changed. Three high-impact AI suggestions where I deviated are documented in [docs/DESIGN.md §6](docs/DESIGN.md#6-ai-assisted-decisions) and [docs/CHOICES.md](docs/CHOICES.md).
+
+---
+
+## 🛠️ Tech Stack
+
+| Layer | Choice | Reason |
+|---|---|---|
+| Detection | YOLOv8 Nano | Fast CPU inference, sufficient accuracy on retail footage |
+| Tracking | Distance-based, custom | Lighter than DeepSORT, fixed-camera friendly |
+| API | FastAPI | Auto-docs, async, Pydantic validation, type-safe |
+| Storage | SQLite (×2) | Zero-infra, portable; events.db + store_intelligence.db (POS) |
+| Real-time | WebSocket | Native FastAPI, no extra broker |
+| Dashboard | Vanilla HTML + JS | One file, no build step |
+| Container | Docker Compose | One-command startup, satisfies acceptance gate |
+| Tests | pytest + coverage | Industry standard, integrates with CI |
+
+---
+
+## 📝 Further Reading
+
+- **[docs/DESIGN.md](docs/DESIGN.md)** — Full architecture, data flow, edge cases, AI-assisted decisions, performance, known limitations
+- **[docs/CHOICES.md](docs/CHOICES.md)** — 3 technical decisions where I deviated from common defaults, with options considered, AI suggestions, and trade-offs
+
+---
+
+## 📜 License
+
+Submission for Purplle Store Intelligence challenge — code is for evaluation purposes.
