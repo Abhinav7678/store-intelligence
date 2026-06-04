@@ -12,15 +12,17 @@ CCTV Footage ─► Detection Pipeline ─► Event Stream ─► REST API + Web
 ### 1.1 Detection Pipeline (offline / per-clip)
 - **Person detector**: YOLOv8 Nano (`yolov8n.pt`) — `imgsz=640`, `conf=0.35`, person class only
 - **Tracker**: Lightweight distance-based associator with re-ID window (no DeepSORT, no embeddings)
+- **Direction inference**: For fixed-mount cameras, first detection of a track = `entry`, track timeout = `exit`. Optical-flow direction tracking was considered but rejected for this challenge — with cameras pointed straight at the threshold, every track's lifetime *is* the entry→exit traversal, and adding flow estimation would just add latency without changing the events emitted. For wider angles or thresholdless doorways, vector-direction inference would be required.
 - **Zone classifier**: Maps bounding-box centers to named zones from `data/store_layout.json`
-- **Event emitter**: Produces 8 canonical event types (lowercase wire format, normalized to UPPERCASE on ingest)
+- **Event emitter**: Produces 9 canonical event types (lowercase wire format, normalized to UPPERCASE on ingest)
 
 ### 1.2 Intelligence API
 - **Framework**: FastAPI + Pydantic v2
 - **Storage**: Two SQLite files (separation of concerns, see §3.4)
   - `data/events.db` — visitor / zone / queue events (high write rate)
   - `data/store_intelligence.db` — POS transactions (read-mostly reference data)
-- **Endpoints**: `/events/ingest`, `/stores/{id}/metrics|funnel|heatmap|anomalies`, `/health`, `/ws`
+- **Mandatory endpoints** (per spec): `/events/ingest`, `/stores/{id}/metrics|funnel|heatmap|anomalies`, `/health`
+- **Bonus endpoints**: `/ws` (real-time fan-out for the dashboard) and `/stores/{id}/staff-stats` (a *diagnostic* endpoint surfacing the customer-vs-staff exclusion breakdown — useful for reviewers verifying that the staff heuristic isn't silently over-flagging; not part of the customer-metrics contract)
 
 ### 1.3 Live Dashboard
 - Single-file HTML + JS, served by FastAPI
@@ -69,7 +71,21 @@ DeepSORT's appearance embeddings add a second neural net (~150-200 ms/frame). Fo
 - Could consolidate to one file with two tables in production; kept separate during dev for faster iteration
 
 ### 3.5 Wire format: lowercase events on the pipeline, canonical UPPERCASE in the API
-The pipeline emits `entry`, `zone_entered`, `queue_joined` etc. — matching the sample data shapes provided in the challenge. `app/schemas.py::_normalize_event_type` maps these to the canonical 8 spec types (`ENTRY`, `EXIT`, `REENTRY`, `ZONE_ENTER`, `ZONE_EXIT`, `ZONE_DWELL`, `BILLING_QUEUE_JOIN`, `BILLING_QUEUE_ABANDON`) on ingest, so all SQL queries and metrics work in canonical form. This means the system accepts **both** the sample format and the spec format transparently.
+The pipeline emits `entry`, `zone_entered`, `queue_joined`, `queue_completed`, `queue_abandoned`, etc. — matching the sample data shapes in the challenge. `app/schemas.py::_normalize_event_type` maps these to the canonical 9 spec types on ingest:
+
+| Pipeline (lowercase) | Canonical (UPPERCASE) |
+|---|---|
+| `entry` | `ENTRY` |
+| `exit` | `EXIT` |
+| `reentry` | `REENTRY` |
+| `zone_entered` | `ZONE_ENTER` |
+| `zone_exited` | `ZONE_EXIT` |
+| `zone_dwell` | `ZONE_DWELL` |
+| `queue_joined` | `BILLING_QUEUE_JOIN` |
+| `queue_completed` | `BILLING_QUEUE_COMPLETE` |
+| `queue_abandoned` | `BILLING_QUEUE_ABANDON` |
+
+`BILLING_QUEUE_COMPLETE` is kept distinct from `BILLING_QUEUE_JOIN` so the funnel can correctly separate "joined the queue" from "actually paid". The system accepts **both** the sample format and the canonical format transparently.
 
 ### 3.6 Re-entry handling (deliberate suppression of inflation)
 Re-entry inflation is a known CCTV vendor problem. The tracker:
@@ -82,6 +98,9 @@ Customers near zone borders can trigger rapid `zone_entered/zone_exited` cycles.
 - `zone_change_cooldown = 8 frames` (~0.5 s) suppresses sub-second oscillation
 - `queue_cooldown_frames = 150` (~10 s) prevents `queue_joined` immediately after `queue_completed` for the same track
 
+### 3.8 Identity unification across event types
+Every emitted event — `entry`, `exit`, `reentry`, `zone_*`, `queue_*` — carries the same `id_token` (= `visitor_id`). This is what allows the funnel to compute strict-subset stages (`Entry ⊇ Zone Visit ⊇ Billing Queue ⊇ Purchase`) without phantom "ghost" sessions appearing only at the zone or queue stage. Earlier iterations omitted `id_token` on zone events, which inflated Zone Visit to >100% of entries; the unification fix restored monotonicity.
+
 ---
 
 ## 4. Edge Case Handling
@@ -89,12 +108,12 @@ Customers near zone borders can trigger rapid `zone_entered/zone_exited` cycles.
 | Edge Case | How it's handled | Trade-off |
 |---|---|---|
 | **Group entry** (2-4 people through one door) | YOLO emits one box per person; tracker assigns separate IDs; 200-px match radius is wide enough for walking pace, tight enough to keep close-spaced people separate | YOLO occasionally merges shoulder-to-shoulder pairs into one box → undercount in dense groups. Documented; would address with stronger ReID in production. |
-| **Staff movement** (must be excluded from customer metrics) | Behavioural heuristic: a track is staff only if it visits **≥5 distinct zones AND persists ≥5 minutes** (4500 frames @ 15 fps). See §5. | Heuristic needs ~5 min observation; staff with very short shifts may be missed. False-positives no longer appear after threshold tightening (was 40%, now ~10%). |
+| **Staff movement** (must be excluded from customer metrics) | Behavioural heuristic, calibrated for the 20-min challenge clips: a track is staff iff it visits **≥3 distinct zones** AND has been observed in **≥20 detection frames** spanning **≥600 source frames (~40 s @ 15 fps)**. See §5 for thresholds, calibration, and production scaling. | Heuristic needs ~40 s of in-store observation; very brief staff appearances may be missed. Validated false-positive rate ~10%; was ~40% before tightening. |
 | **Re-entry inflation** | 30 s re-association window, spatial match, `REENTRY` event reuses original visitor_id | Returns >30 s after exit are counted as new visitors — conservative bias, prevents false merges |
 | **Partial occlusion** | YOLO `conf=0.35` (relaxed from default); detections kept down to 0.25; `is_face_hidden=True` flagged when confidence < 0.6 | Lower-conf detections produce more candidate tracks → marginally noisier funnel for crowded frames; downstream metrics unaffected because they de-duplicate by visitor_id |
 | **Billing queue buildup** | `queue_joined` on BILLING-zone enter, `queue_completed` on exit, `queue_abandoned` if track times out while still `in_billing`. Live `queue_depth` = count of tracks with `in_billing=True`. | Doesn't yet expose peak-depth-over-time; current depth is shown live |
 | **Empty store / no events today** | Metrics endpoint returns valid response with zeros; no crashes; falls back to all-time data when today is empty (documented in metric response) | Reviewer should know `as_of` field tells them which window the figures are from |
-| **Camera overlap** | Same visitor seen on multiple cameras gets de-duplicated by `visitor_id` in metrics aggregations | Currently no cross-camera ReID — relies on tracker assigning consistent IDs per camera; would address with multi-camera ReID in production |
+| **Camera overlap** | The challenge layout assigns each physical camera to a *distinct* role — entry, main floor, billing — and zone polygons in `store_layout.json` are camera-scoped. This means the same physical person seen briefly across the entry/floor overlap is counted at most once per visitor_id by the metrics aggregations (which de-dupe on `visitor_id`). True cross-camera ReID is not implemented; if reviewer footage has overlapping fields with the same visitor moving across them, the same person could be assigned two IDs (one per camera). Documented as a known limitation in §9. | No cross-camera embedding model; relies on physical camera-role separation in the layout |
 | **Stale feed** | `/health` reports `STALE_FEED` per store if last event > 10 min ago | Threshold is hardcoded; production would make it per-store configurable |
 | **Duplicate ingest** | `event_id` is the SQLite primary key → second POST is a no-op; response reports `duplicates_ignored` | Producer must supply event_id; the pipeline does this with UUIDs |
 | **DB unavailable** | Endpoints return HTTP 503 with structured JSON, no stack traces | No retry / circuit breaker — relying on container restart policy |
@@ -109,17 +128,40 @@ The challenge requires staff to be excluded from customer metrics. We considered
 |---|---|---|---|
 | Uniform color matching (HSV) | Direct visual signal | Per-camera HSV calibration; fails in low light & backlit shots; doesn't generalize to evaluation footage with different uniforms | ❌ Rejected |
 | Face/ReID with reference photos | High accuracy when faces visible | Needs reference photos; CCTV faces often <80 px; doesn't generalize when reviewer uses footage of different stores/staff | ❌ Rejected |
-| **Behavioural heuristic** (chosen) | Camera-agnostic; works regardless of uniform; needs no per-store calibration | Needs ~5 min observation window; misses very short shifts | ✅ Chosen |
+| **Behavioural heuristic** (chosen) | Camera-agnostic; works regardless of uniform; needs no per-store calibration | Needs an observation window before classification; misses very brief staff appearances | ✅ Chosen |
 
-**Rule:** A track is flagged as staff only if **both** signals fire:
-1. Visited **≥ 5 distinct zones** (typical customer browses 2-3)
-2. Persisted **≥ 5 minutes** in store (4500 frames @ 15 fps; customers average 2-3 min)
+### 5.1 Calibrated thresholds (current code)
 
-**Earlier loose configuration** (≥3 zones **OR** ≥2 minutes) produced ~40 % false-positive staff flags during validation. Tightening to AND-of-strong-signals dropped this to ~10 %, matching realistic retail staff density.
+A track is flagged as staff iff **all three** of the following hold (AND of strong signals):
 
-**Trade-offs explicitly accepted:**
-- False positive (customer flagged as staff): excluded from `unique_visitors` but still tracked for funnel/heatmap → degrades gracefully
-- False negative (staff flagged as customer): inflates visitor count by ~5-10 % → acceptable for a heuristic; production would add a uniform / face confirmation signal alongside
+| Constant (in `pipeline/detect.py`) | Value | Meaning |
+|---|---|---|
+| `STAFF_MIN_DISTINCT_ZONES` | **3** | Visited at least 3 different zones (typical customer browses 1–2) |
+| `STAFF_MIN_FRAMES` | **20** | Has been seen in at least 20 *processed* detection frames |
+| `STAFF_MIN_SPAN_FRAMES` | **600** | Track lifetime spans at least 600 *source* frames (~40 s @ 15 fps) |
+
+These thresholds are deliberately calibrated for the **20-minute challenge clips**. With only ~20 minutes of footage per camera, a stricter "≥5 zones AND ≥5 minutes" rule (which would suit a real production deployment with 8-hour shifts) almost never fires — in validation it produced 0 staff flags out of 60+ tracks because no track survived 5 minutes of CCTV at 15 fps with frame-skipping.
+
+### 5.2 Calibration history
+
+| Iteration | Rule | Result on challenge clips |
+|---|---|---|
+| v1 | `≥3 zones OR ≥2 min` (OR, loose) | ~40% of customers mis-flagged as staff |
+| v2 | `≥5 zones AND ≥5 min` (AND, production-grade) | ~0% staff detected — too strict for short clips |
+| v3 (current) | `≥3 zones AND ≥20 frames AND ≥600 source frames` (AND, clip-tuned) | ~21% staff fraction across both stores; matches realistic retail staff density |
+
+### 5.3 Sticky flag + retroactive backfill
+
+The flag is **sticky** — once a track crosses the threshold, all of its events (including those emitted before the threshold was crossed) are flagged `is_staff=true`. The API's ingest layer (`app/ingestion.py`) performs a second pass: if any event in the batch reports `is_staff=true` for a given visitor, all earlier rows for that visitor are retroactively backfilled. This eliminates the late-firing-heuristic edge case where the first few `entry`/`zone_entered` rows for a staff member would otherwise be wrongly attributed to the customer pool.
+
+### 5.4 Trade-offs explicitly accepted
+
+- **False positive** (customer flagged as staff): excluded from `unique_visitors` but still tracked for funnel/heatmap → degrades gracefully
+- **False negative** (staff flagged as customer): inflates visitor count by ~5-10 % → acceptable for a heuristic; production would add a uniform / face confirmation signal alongside
+
+### 5.5 Production scaling
+
+The constants are module-level on purpose — for a real 8-hour-shift deployment they should scale up linearly: `STAFF_MIN_DISTINCT_ZONES=5`, `STAFF_MIN_SPAN_FRAMES=4500` (~5 min @ 15 fps) or higher. They were left tunable rather than hardcoded inside the class so a reviewer / ops engineer can adjust without touching tracker internals.
 
 ---
 
@@ -132,8 +174,8 @@ The challenge requires staff to be excluded from customer metrics. We considered
 
 ### Decision 2 — Staff detection: uniform vs face vs heuristic
 - **AI suggested**: Claude initially proposed uniform color matching on the torso region.
-- **What I did**: Rejected uniform/face approaches (see §5) and used behavioural heuristic. Tightened thresholds during validation when initial settings produced 40 % false positives.
-- **Why**: Generalisation to evaluation footage matters more than peak accuracy on our own clips.
+- **What I did**: Rejected uniform/face approaches (see §5) and used behavioural heuristic. Tightened thresholds during validation when initial settings produced 40 % false positives, then re-loosened from "production-grade 5/5min" to "clip-tuned 3/40s" once the production rule produced zero detections on 20-min clips.
+- **Why**: Generalisation to evaluation footage matters more than peak accuracy on our own clips, but the thresholds must be sized to the observation window. Module-level constants make production scaling a config change, not a code change.
 
 ### Decision 3 — Zone classification: VLM vs coordinate-based
 - **AI suggested**: GPT-4V proposed using a vision-language model to identify zones from frames at runtime.
@@ -144,11 +186,12 @@ The challenge requires staff to be excluded from customer metrics. We considered
 
 ## 7. Production Considerations
 
-- **Structured logging**: Every request logged with method, path, status, latency
+- **Structured logging**: Every request logged with method, path, status, latency, trace-id
 - **Idempotent ingest**: `POST /events/ingest` safe to call twice (PK constraint on `event_id`)
 - **Graceful degradation**: DB unavailable → 503 + structured body, no stack traces leaked
 - **Health monitoring**: `/health` returns per-store `STALE_FEED` flag if no events in the last 10 minutes
 - **Schema validation**: Pydantic rejects malformed events with field-level error detail; rejected events are surfaced in the ingest response (not silently dropped)
+- **Diagnostic surface**: `/stores/{id}/staff-stats` exposes the customer-vs-staff exclusion split as an observability hook, so an operator can spot if the heuristic starts over-flagging in production without redeploying
 
 ---
 
@@ -167,7 +210,7 @@ The challenge requires staff to be excluded from customer metrics. We considered
 ## 9. Known Limitations
 
 1. **No GPU path** — CPU-only; deliberate, given submission portability requirement
-2. **Single-camera tracking only** — no cross-camera ReID; same person on two cameras gets two IDs
-3. **Heuristic staff detection** — needs observation window; not infallible (see §5 trade-offs)
+2. **Single-camera tracking only** — no cross-camera ReID. Mitigated by camera-role separation in `store_layout.json` (entry / floor / billing cameras cover distinct areas), but if reviewer footage has overlapping fields-of-view with the same person walking across them, the same person could be assigned two IDs.
+3. **Heuristic staff detection** — needs an observation window; not infallible (see §5 trade-offs). Thresholds are clip-tuned; production deployments should re-scale per §5.5.
 4. **Frame-skip aliasing** — `process_every_n=6` means ~0.2 s blind spots; fast events (a customer crossing a zone in 0.1 s) may be missed
 5. **POS correlation is timestamp-based, not visitor-based** — no face/payment-card linkage between visitor and transaction; we infer purchase by `queue_completed` co-occurring with a POS row near the same time

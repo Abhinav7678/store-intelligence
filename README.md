@@ -30,9 +30,9 @@ To populate the dashboard with data, see [Running the Detection Pipeline](#-runn
 | 3 | Aggregation endpoints | Live metrics, funnel, heatmap, anomalies |
 | 4 | HTML dashboard | Real-time KPI tiles + funnel chart |
 
-**Event types (8 canonical):** `ENTRY`, `EXIT`, `REENTRY`, `ZONE_ENTER`, `ZONE_EXIT`, `ZONE_DWELL`, `BILLING_QUEUE_JOIN`, `BILLING_QUEUE_ABANDON`
+**Event types (9 canonical):** `ENTRY`, `EXIT`, `REENTRY`, `ZONE_ENTER`, `ZONE_EXIT`, `ZONE_DWELL`, `BILLING_QUEUE_JOIN`, `BILLING_QUEUE_COMPLETE`, `BILLING_QUEUE_ABANDON`
 
-The pipeline emits the sample-data lowercase form (`entry`, `zone_entered`, `queue_joined`) and the API normalizes to canonical UPPERCASE on ingest — see [DESIGN.md §3.5](docs/DESIGN.md#35-wire-format-lowercase-events-on-the-pipeline-canonical-uppercase-in-the-api).
+The pipeline emits the sample-data lowercase form (`entry`, `zone_entered`, `queue_joined`, `queue_completed`, `queue_abandoned`) and the API normalizes to canonical UPPERCASE on ingest — see [DESIGN.md §3.5](./DESIGN.md#35-wire-format-lowercase-events-on-the-pipeline-canonical-uppercase-in-the-api).
 
 ---
 
@@ -68,12 +68,13 @@ CCTV clips (multi-store, multi-camera)
                └────────────────┘
 ```
 
-See [DESIGN.md](docs/DESIGN.md) for full data flow and design decisions.
+See [DESIGN.md](./DESIGN.md) for full data flow and design decisions.
 
 ---
 
 ## 🔌 API Endpoints
 
+### Mandatory (per spec)
 | Endpoint | Method | Description |
 |---|---|---|
 | `/events/ingest` | POST | Batch up to 500 events, idempotent on `event_id` |
@@ -81,8 +82,12 @@ See [DESIGN.md](docs/DESIGN.md) for full data flow and design decisions.
 | `/stores/{store_id}/funnel` | GET | ENTRY → ZONE → QUEUE → PURCHASE with drop-off % |
 | `/stores/{store_id}/heatmap` | GET | Per-zone visit count, dwell, score (0-100) |
 | `/stores/{store_id}/anomalies` | GET | Queue spike, dead zone, conversion drop alerts |
-| `/stores/{store_id}/staff-stats` | GET | Customer vs staff exclusion breakdown |
 | `/health` | GET | Per-store `STALE_FEED` detection (>10 min lag) |
+
+### Bonus / Diagnostic
+| Endpoint | Method | Description |
+|---|---|---|
+| `/stores/{store_id}/staff-stats` | GET | Customer vs staff exclusion breakdown — observability hook to verify the staff heuristic isn't over-flagging |
 | `/ws` | WS | Real-time event broadcast for the dashboard |
 | `/` | GET | Live dashboard (HTML) |
 | `/docs` | GET | Swagger UI |
@@ -151,11 +156,11 @@ store-intelligence/
 ├── app/
 │   ├── main.py             # FastAPI entrypoint
 │   ├── schemas.py          # Pydantic models + event-type normalization
-│   ├── ingestion.py        # POST /events/ingest with idempotency
+│   ├── ingestion.py        # POST /events/ingest with idempotency + staff backfill
 │   ├── metrics.py          # /metrics + /staff-stats
 │   ├── funnel.py           # /funnel with drop-off
-│   ├── heatmap.py          # /heatmap (count + dwell)
-│   ├── anomalies.py        # /anomalies (queue spike, dead zone, etc.)
+│   ├── heatmap.py          # /heatmap (count + dwell, end-of-session fallback)
+│   ├── anomalies.py        # /anomalies (queue spike, dead zone, conversion drop)
 │   ├── health.py           # /health with stale-feed detection
 │   ├── sessions.py         # Session reconstruction + POS correlation
 │   ├── ws.py               # WebSocket broadcast hub
@@ -168,10 +173,9 @@ store-intelligence/
 │   └── run.sh              # End-to-end orchestrator
 ├── dashboard/
 │   └── index.html          # Live HTML dashboard
-├── tests/                  # pytest suite (>80% coverage on app/)
-├── docs/
-│   ├── DESIGN.md           # Architecture + edge cases + AI decisions
-│   └── CHOICES.md          # 3 deep-dive technical decisions
+├── tests/                  # pytest suite (~78% coverage on app/)
+├── DESIGN.md               # Architecture + edge cases + AI decisions
+├── CHOICES.md              # 3 deep-dive technical decisions
 ├── data/
 │   ├── store_layout.json   # Zone polygons + camera mappings (sample committed)
 │   ├── events.db           # Event store (gitignored, regenerated)
@@ -190,16 +194,18 @@ store-intelligence/
 ```bash
 pytest tests/ -v --cov=app --cov-report=term-missing
 ```
-Current coverage: **>80%** on `app/`. Tests cover ingest idempotency, metrics math, funnel drop-off, anomaly thresholds, schema validation, and WebSocket fan-out.
+Current coverage: **~78%** on `app/`. Tests cover ingest idempotency, metrics math, funnel drop-off, anomaly thresholds, schema validation, session reconstruction, and WebSocket fan-out.
+
+Every test file begins with a `# PROMPT: ... # CHANGES MADE: ...` header recording the AI prompt that scaffolded it and the changes made afterwards (per challenge Part D requirements).
 
 ---
 
 ## ⚡ Edge Cases Handled
 
-Documented in detail in [DESIGN.md §4](docs/DESIGN.md#4-edge-case-handling). Summary:
+Documented in detail in [DESIGN.md §4](./DESIGN.md#4-edge-case-handling). Summary:
 
 - **Group entry** — per-person tracking, 200-px match radius keeps close-spaced people separate
-- **Staff exclusion** — behavioural heuristic (≥5 zones AND ≥5 min); ~10% staff fraction (was 40% before tightening)
+- **Staff exclusion** — behavioural heuristic, **clip-tuned** thresholds: ≥3 distinct zones AND ≥20 detection frames AND ≥600 source frames (~40 s @ 15 fps); sticky flag with retroactive backfill on ingest. ~21% staff fraction across both stores; was ~40% under earlier OR-rule. Production deployments would scale up to ≥5 zones / ≥5 min — see [DESIGN.md §5.5](./DESIGN.md#55-production-scaling).
 - **Re-entry** — 30 s spatial-match window emits `REENTRY` reusing visitor_id (suppresses inflation)
 - **Partial occlusion** — `conf=0.35`; low-conf detections kept and flagged via `is_face_hidden`
 - **Queue buildup** — live `queue_depth`, `queue_joined`/`completed`/`abandoned` events with positions
@@ -208,6 +214,7 @@ Documented in detail in [DESIGN.md §4](docs/DESIGN.md#4-edge-case-handling). Su
 - **Duplicate ingest** — `event_id` PK constraint + `duplicates_ignored` in response
 - **Stale feed** — `/health` flags any store with no events in last 10 min
 - **DB unavailable** — HTTP 503 with structured body, no stack traces
+- **Camera overlap** — mitigated by camera-role separation in `store_layout.json` (entry / floor / billing cameras cover distinct areas); no cross-camera ReID — see [DESIGN.md §9](./DESIGN.md#9-known-limitations)
 
 ---
 
@@ -217,7 +224,7 @@ Documented in detail in [DESIGN.md §4](docs/DESIGN.md#4-edge-case-handling). Su
 - **Claude (Anthropic)** — architecture decisions, edge-case analysis, staff-detection trade-offs
 - **ChatGPT** — documentation drafting, test scenario brainstorming
 
-Every test file has a `# PROMPT:` header recording the prompt and what was kept/changed. Three high-impact AI suggestions where I deviated are documented in [docs/DESIGN.md §6](docs/DESIGN.md#6-ai-assisted-decisions) and [docs/CHOICES.md](docs/CHOICES.md).
+Every test file has a `# PROMPT:` header recording the prompt and what was kept/changed. Three high-impact AI suggestions where I deviated are documented in [DESIGN.md §6](./DESIGN.md#6-ai-assisted-decisions) and [CHOICES.md](./CHOICES.md).
 
 ---
 
@@ -238,8 +245,8 @@ Every test file has a `# PROMPT:` header recording the prompt and what was kept/
 
 ## 📝 Further Reading
 
-- **[docs/DESIGN.md](docs/DESIGN.md)** — Full architecture, data flow, edge cases, AI-assisted decisions, performance, known limitations
-- **[docs/CHOICES.md](docs/CHOICES.md)** — 3 technical decisions where I deviated from common defaults, with options considered, AI suggestions, and trade-offs
+- **[DESIGN.md](./DESIGN.md)** — Full architecture, data flow, edge cases, AI-assisted decisions, performance, known limitations
+- **[CHOICES.md](./CHOICES.md)** — 3 technical decisions where I deviated from common defaults, with options considered, AI suggestions, and trade-offs
 
 ---
 

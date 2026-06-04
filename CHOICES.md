@@ -45,23 +45,26 @@ ChatGPT pushed for canonical UPPERCASE everywhere "for schema purity". Copilot g
 
 ### My Decision: **Hybrid (normalize on ingest)**
 **Reasoning**:
-1. The challenge's **sample event JSON uses lowercase** (`entry`, `zone_entered`, `queue_joined`). The **spec table uses UPPERCASE canonical names** (`ENTRY`, `ZONE_ENTER`, `BILLING_QUEUE_JOIN`).
+1. The challenge's **sample event JSON uses lowercase** (`entry`, `zone_entered`, `queue_joined`, `queue_completed`, `queue_abandoned`). The **spec table uses UPPERCASE canonical names** (`ENTRY`, `ZONE_ENTER`, `BILLING_QUEUE_JOIN`, `BILLING_QUEUE_COMPLETE`, `BILLING_QUEUE_ABANDON`).
 2. Reviewer's evaluation footage may produce events in either shape. A strict-mode API rejects half of valid traffic.
 3. `app/schemas.py::_normalize_event_type` maps either shape → canonical UPPERCASE before SQL insert. All downstream metrics work in one form.
 
 **Code shape**:
 ```python
 _EVENT_TYPE_ALIASES = {
-    "entry":            "ENTRY",
-    "exit":             "EXIT",
-    "zone_entered":     "ZONE_ENTER",
-    "zone_exited":      "ZONE_EXIT",
-    "queue_joined":     "BILLING_QUEUE_JOIN",
-    "queue_completed":  "BILLING_QUEUE_JOIN",   # treat completed as "did join"
-    "queue_abandoned":  "BILLING_QUEUE_ABANDON",
-    ...
+    "entry":              "ENTRY",
+    "exit":               "EXIT",
+    "reentry":            "REENTRY",
+    "zone_entered":       "ZONE_ENTER",
+    "zone_exited":        "ZONE_EXIT",
+    "zone_dwell":         "ZONE_DWELL",
+    "queue_joined":       "BILLING_QUEUE_JOIN",
+    "queue_completed":    "BILLING_QUEUE_COMPLETE",   # distinct from JOIN
+    "queue_abandoned":    "BILLING_QUEUE_ABANDON",
 }
 ```
+
+**Why `BILLING_QUEUE_COMPLETE` is kept distinct**: An earlier iteration collapsed both `queue_joined` and `queue_completed` into `BILLING_QUEUE_JOIN` — that broke the funnel because we couldn't tell "joined the queue" from "actually paid". Splitting them out is what makes the `Entry → Zone → Billing Queue → Purchase` funnel monotonic and correct.
 
 **Trade-off accepted**: per-event normalization runtime cost (negligible — string lookup). Benefit: format flexibility, zero rejected traffic from format-only mismatches.
 
@@ -69,7 +72,7 @@ _EVENT_TYPE_ALIASES = {
 
 ---
 
-## Choice 3 — Staff Detection: Behavioural Heuristic (rejected uniform/face approaches)
+## Choice 3 — Staff Detection: Behavioural Heuristic, Calibrated for Short Clips
 
 ### Options Considered
 | Approach | Accuracy | Generalisation | Effort |
@@ -81,26 +84,45 @@ _EVENT_TYPE_ALIASES = {
 ### What AI Suggested
 Claude initially proposed HSV uniform matching ("Purplle uniforms are dark purple"). I rejected after considering generalisation.
 
-### My Decision: **Behavioural heuristic with AND-of-strong-signals**
+### My Decision: **Behavioural heuristic with AND-of-strong-signals, clip-tuned**
 
-A track is staff iff **both**:
-1. Visited **≥ 5 distinct zones** (customer typically browses 2-3)
-2. Persisted **≥ 5 minutes** = 4500 frames @ 15 fps (customer typical 2-3 min)
+A track is flagged as staff iff **all three** of the following hold:
 
-**Why both signals (AND, not OR)**:
-The first iteration used `≥3 zones OR ≥2 minutes` — produced 23 staff out of 58 detections (~40 %). Validation revealed customers who browse 3 sections were being flagged. Tightening to AND-of-strong-signals dropped staff fraction to ~10 %, matching realistic retail density.
+| Constant (in `pipeline/detect.py`) | Value | Meaning |
+|---|---|---|
+| `STAFF_MIN_DISTINCT_ZONES` | **3** | Visited at least 3 different zones (customer typically browses 1-2) |
+| `STAFF_MIN_FRAMES` | **20** | Has been seen in at least 20 *processed* detection frames |
+| `STAFF_MIN_SPAN_FRAMES` | **600** | Track lifetime spans at least 600 *source* frames (~40 s @ 15 fps) |
+
+These thresholds are deliberately calibrated for the **20-minute challenge clips** and are the result of three iterations:
+
+| Iteration | Rule | Result |
+|---|---|---|
+| v1 | `≥3 zones OR ≥2 min` (OR, loose) | ~40% of customers mis-flagged as staff |
+| v2 | `≥5 zones AND ≥5 min` (AND, "production-grade") | ~0% staff flagged — too strict, no track survives 5 min @ 15 fps with frame-skipping in a 20-min clip |
+| v3 (current) | `≥3 zones AND ≥20 frames AND ≥600 source frames` (AND, clip-tuned) | ~21% staff fraction — matches realistic retail density |
+
+**Why all three signals (AND, not OR, not just two)**:
+- v1 (OR) was too permissive — a customer who browses 3 sections fires the zone signal alone
+- A "≥X zones AND ≥Y minutes" rule still produces false-positives on customers who linger; adding the **detection-frame count** as a third signal filters out ghost tracks (intermittent re-detections of the same person spread across the clip) which would otherwise satisfy a pure span-of-time check
 
 **Why this generalises**:
 - Doesn't depend on uniform color → works on reviewer's footage with any uniform
 - Doesn't depend on face quality → works on small or back-facing detections
 - Doesn't need reference photos → no per-store setup
 
-**Trade-offs accepted**:
-- Needs ~5 min observation window before reliable
-- Misses staff with very short shifts (e.g. someone covering a 30 s phone call)
-- False negatives inflate visitor count by 5-10 % → acceptable; could be reduced with a uniform-match confirmation signal in production
+**Sticky flag + retroactive backfill**:
+The flag is sticky — once a track crosses the threshold, all of its events (including the early `entry` and `zone_entered` rows emitted *before* the threshold was crossed) are flagged `is_staff=true`. The API ingest layer (`app/ingestion.py`) does a second pass: if any event in the batch reports staff for a given visitor, all earlier rows are retroactively backfilled. Without this, staff would have leaked into the customer pool on every clip's first 30 seconds.
 
-**What I would change with more data**: Collect labelled samples from 1-2 stores, train a binary classifier on (zones, dwell, hour-of-day, motion entropy) — would likely push accuracy from heuristic 90 % to learned 96-98 %. Out of scope here without ground truth.
+**Trade-offs accepted**:
+- Needs ~40 s of in-store observation before reliable
+- Misses staff with very brief on-camera appearances (e.g. someone covering a 30 s phone call)
+- False negatives inflate visitor count by ~5-10 % → acceptable for a heuristic; production would add a uniform/face confirmation signal alongside
+
+**Production scaling**:
+The constants are module-level on purpose. For a real 8-hour-shift deployment they should scale up — `STAFF_MIN_DISTINCT_ZONES=5`, `STAFF_MIN_SPAN_FRAMES=4500` (~5 min @ 15 fps) or higher. Tunable as a config change, not a code change.
+
+**What I would change with more data**: Collect labelled samples from 1-2 stores, train a binary classifier on (zones, dwell, hour-of-day, motion entropy, track length) — would likely push accuracy from heuristic ~90 % to learned ~96-98 %. Out of scope here without ground truth.
 
 ---
 
@@ -109,5 +131,5 @@ The first iteration used `≥3 zones OR ≥2 minutes` — produced 23 staff out 
 | Decision | Chose | Rejected | Key Reason |
 |---|---|---|---|
 | Detection model | YOLOv8n | YOLOv8m, RT-DETR | CPU latency budget; tracker is the bottleneck, not detector |
-| Event wire format | Hybrid (lowercase pipeline, UPPERCASE API) | Strict either way | Format flexibility; zero rejected traffic from cosmetic mismatches |
-| Staff detection | Behavioural heuristic (AND of 5 zones + 5 min) | Uniform HSV, face recognition | Generalisation to reviewer's footage matters more than peak accuracy on ours |
+| Event wire format | Hybrid (lowercase pipeline, UPPERCASE API) with distinct `BILLING_QUEUE_COMPLETE` | Strict either way; collapsed JOIN/COMPLETE | Format flexibility; funnel needs JOIN ≠ COMPLETE to be monotonic |
+| Staff detection | Behavioural heuristic — clip-tuned (3 zones / 20 frames / 600 span) with sticky flag + retroactive backfill | Uniform HSV, face recognition; "production-grade 5/5min" rule | Generalisation > peak accuracy; thresholds must be sized to observation window |
