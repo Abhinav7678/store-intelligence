@@ -23,7 +23,7 @@ To populate the dashboard with data, see [Running the Detection Pipeline](#-runn
 
 ## 🎬 Live Dashboard Demo
 
-Real-time KPIs, funnel chart, queue depth and anomaly alerts updating as detection events flow through the WebSocket fan-out (`/ws`):
+Real-time APIs, funnel chart, queue depth and anomaly alerts updating as detection events flow through the WebSocket fan-out (`/ws`):
 
 ![Store Intelligence Dashboard — Live Demo](docs/media/dashboard-demo.gif)
 
